@@ -525,9 +525,9 @@ function Fix_all_files($file1_path, $file2_path, $block_type, &$log_content) {
 						$processed_blocks[$formattedKey] = true;
 					}
 				}
-			} elseif (strpos($line, 'Description: Cannot locate resource') !== false || strpos($line, 'Description: Unable to load mesh') !== false) {
+			} elseif (strpos($line, 'Description: Unable to derive resource group for') !== false || strpos($line, 'Description: Cannot locate resource') !== false || strpos($line, 'Description: Unable to load mesh') !== false) {
 				// Biểu thức chính quy để bắt tên file .mesh trước cụm từ "in resource group"
-				if (preg_match('/Cannot locate resource (\S+\.mesh)/', $line, $matches) || preg_match('/Unable to load mesh (\S+\.mesh)/', $line, $matches)) {
+				if (preg_match('/Unable to derive resource group for (\S+\.mesh)/', $line, $matches) || preg_match('/Unable to derive resource group for (\S+\.skeleton)/', $line, $matches) || preg_match('/Cannot locate resource (\S+\.skeleton)/', $line, $matches) || preg_match('/Cannot locate resource (\S+\.mesh)/', $line, $matches) || preg_match('/Unable to load mesh (\S+\.mesh)/', $line, $matches)) {
 					$fileName = $matches[1];
 					// Kiểm tra xem $fileName có chứa '/' hay không
 					if (strpos($fileName, '/') !== false) {
