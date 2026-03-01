@@ -1,4 +1,4 @@
-﻿#define _GNU_SOURCE
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdint.h>
 #include <dlfcn.h>
@@ -174,7 +174,10 @@ struct GlobalPointers {
 	std::atomic<void*> g_NotifyEquipAttr_Func{nullptr};
 	std::atomic<void*> g_RandomAttrRate_Func{nullptr};  // nếu có hàm random riêng
 	//
-
+	// Thêm vào struct GlobalPointers (hoặc global riêng)
+	std::atomic<void*> g_lua_interface{nullptr};  // LuaInterface*
+	std::atomic<lua_State*> g_lua_state{nullptr}; // lua_State* để dùng trực tiếp
+	
 };
 
 static GlobalPointers g_globals;
@@ -515,7 +518,7 @@ static void debug_ride_table_to_file() {
     time_t now = time(nullptr);
     struct tm tm_info;
     localtime_r(&now, &tm_info);
-    strftime(filename, sizeof(filename), "/home/tlbb/Server/Log/ride_table_%Y%m%d_%H%M%S.txt", &tm_info);
+    strftime(filename, sizeof(filename), "/home/tlbb/Server/Log/ride_table_%Y%m%d.txt", &tm_info);
     
     FILE* f = fopen(filename, "w");
     if (!f) return;
@@ -532,16 +535,28 @@ static void debug_ride_table_to_file() {
         fprintf(f, "dword_103FD44 Ride[%d] (offset 0x%x) = %d\n", i, i * 340, ride_id);
     }
     
-    // In impacts
-    fprintf(f, "\n--- Impacts (85 per ride) ---\n");
-    for (int ride_idx = 0; ride_idx < rideCount; ride_idx++) {
-        int base_idx = ride_idx * 85;
-        int ride_id = *(int*)((uintptr_t)dword_103FD44 + (ride_idx * 340));
-        fprintf(f, "\ndword_103FD44 Ride %d (ID %d):\n", ride_idx, ride_id);
-        for (int impact_offset = 0; impact_offset < 85; impact_offset++) {
-            fprintf(f, " dword_103FD44 impact[%d] = %d\n", impact_offset, dword_103FE70[base_idx + impact_offset]);
-        }
-    }
+	// In impacts
+	fprintf(f, "\n--- Impacts (85 per ride) ---\n");
+	for (int ride_idx = 0; ride_idx < rideCount; ride_idx++) {
+		int base_idx = ride_idx * 85;
+		int ride_id = *(int*)((uintptr_t)dword_103FD44 + (ride_idx * 340));  // Đúng: mỗi ride cách 340 bytes
+		fprintf(f, "\nRide %d (ID %d):\n", ride_idx, ride_id);
+		for (int impact_offset = 0; impact_offset < 85; impact_offset++) {
+			// dword_103FE70 là mảng int liên tục, mỗi phần tử 4 byte
+			fprintf(f, "  impact[%d] = %d\n", impact_offset, dword_103FE70[base_idx + impact_offset]);
+		}
+	}
+
+	fprintf(f, "\n--- dword_103FE70 full array (total %d entries) ---\n", rideCount * 85);
+	// In toàn bộ dword_103FE70 từ đầu đến cuối, không reset về 0
+	for (int i = 0; i < rideCount * 85; i++) {
+		int ride_idx = i / 85;
+		int impact_offset = i % 85;
+		fprintf(f, "dword_103FE70[%d] (ride %d, impact %d) = %d\n", 
+				i, ride_idx, impact_offset, dword_103FE70[i]);
+	}
+	
+	fprintf(f, "\n");
     
     fclose(f);
     LOG("Ride table dumped to %s", filename);
@@ -559,6 +574,7 @@ static void debug_ride_table_to_file() {
 	*/
 extern "C"
 int64_t skill005_hook(void* _this, unsigned int* a2, int a3) {
+    LOG("==== skill005_hook thú cưỡi Impact START ====");
     if (!a2) {
         LOG("a2 NULL");
         return 0;
@@ -638,7 +654,7 @@ int64_t skill005_hook(void* _this, unsigned int* a2, int a3) {
         }
     }
     LOG("v4=%d", v4);
-
+	
     int ExteriorRideMaxSpeed = get_max_speed((void*)a2);
     LOG("ExteriorRideMaxSpeed=%d", ExteriorRideMaxSpeed);
 
@@ -649,34 +665,42 @@ int64_t skill005_hook(void* _this, unsigned int* a2, int a3) {
     }
     LOG("table index=%d", index);
 
-    int v6 = dword_103FE70[index];
-
+    int nImpact = dword_103FE70[index];
     switch (ExteriorRideMaxSpeed) {
-        case 20: v6 = dword_103FE70[index + 1]; break;
-        case 40: v6 = dword_103FE70[index + 2]; break;
-        case 60: v6 = dword_103FE70[index + 3]; break;
-        case 70: v6 = dword_103FE70[index + 4]; break;
-        case 75: v6 = dword_103FE70[index + 5]; break;
-        case 80: v6 = dword_103FE70[index + 6]; break;
-        case 85: v6 = dword_103FE70[index + 7]; break;
-        case 90: v6 = dword_103FE70[index + 8]; break;
-        case 95: v6 = dword_103FE70[index + 9]; break;
+        case 20: nImpact = dword_103FE70[index + 1]; break;
+        case 40: nImpact = dword_103FE70[index + 2]; break;
+        case 60: nImpact = dword_103FE70[index + 3]; break;
+        case 70: nImpact = dword_103FE70[index + 4]; break;
+        case 75: nImpact = dword_103FE70[index + 5]; break;
+        case 80: nImpact = dword_103FE70[index + 6]; break;
+        case 85: nImpact = dword_103FE70[index + 7]; break;
+        case 90: nImpact = dword_103FE70[index + 8]; break;
+        case 95: nImpact = dword_103FE70[index + 9]; break;
         default: break;
     }
+	
+    LOG("nImpact (impact id)=%d", nImpact);
+	//fix thu cuoi toc do 85%
+    //LOG("81 = %d",  index +81);
+    //LOG("82 = %d",  index +82);
+    //LOG("83 = %d",  index +83);
+	// vị trí tốc độ của thú cưỡi trong Exterior_Ride.txt, fix impact thú cưỡi + 85%
+	if (dword_103FE70[index + 82] == 85) {
+		nImpact = nImpact + 1;
+		LOG("Fix impact Ride 85% = %d",  nImpact);
+	}
 
-    LOG("v6 (impact id)=%d", v6);
-
-    if (v6 <= 0) {
+    if (nImpact <= 0) {
         LOG("invalid impact");
         return 0;
     }
 
     // Gửi impact, +1 theo nhu cầu
-    int v8 = send_impact(impact_core, a2, (unsigned short)v6, a2[2], 1, 100);
-    LOG("SendImpact result=%d", v8);
+    int result = send_impact(impact_core, a2, (unsigned short)nImpact, a2[2], 1, 100);
+    LOG("SendImpact result=%d", result);
 
-    if (!v8) {
-        LOG("SendImpact FAILED impact=%d", v6);
+    if (!result) {
+        LOG("SendImpact FAILED impact=%d", nImpact);
         return 0;
     }
 
@@ -701,6 +725,10 @@ static pthread_mutex_t g_lua_mutex = PTHREAD_MUTEX_INITIALIZER;
 typedef struct lua_State lua_State;
 typedef int (*lua_CFunction)(lua_State *L);
 static void* g_lua_interface = nullptr;          // LuaInterface*
+// Typedef cho Init
+typedef void (LuaInterface::*InitFn)(Scene*);
+static InitFn orig_Init = nullptr;
+
 
 //khai báo
 extern "C" {
@@ -760,29 +788,70 @@ extern "C" {
         int p6, int p7, int p8, int p9, int p10, int p11
     );
 }
+// Biến flag để biết đã hook Init chưa
+static bool g_init_hooked = false;
 
 void resolve_lua_interface() {
-    uintptr_t base = get_module_base("Server");
-    if (!base) {
-        LOG("Không tìm thấy base address của Server");
+    if (g_lua_interface.load() != nullptr) {
+        return;  // Đã có rồi
+    }
+
+    orig_Init = (InitFn)dlsym(RTLD_NEXT, "_ZN12LuaInterface4InitEP5Scene");
+    if (orig_Init == nullptr) {
+        LOG("resolve_lua_interface: Không tìm thấy symbol LuaInterface::Init !");
         return;
     }
 
-    // THAY OFFSET NÀY BẰNG OFFSET THỰC TỪ GHIDRA
-    uintptr_t lua_interface_offset = 0x2B4C80;  // <-- OFFSET BẠN TÌM ĐƯỢC
+    LOG("resolve_lua_interface: Tìm thấy LuaInterface::Init tại %p", (void*)orig_Init);
 
-    //g_lua_interface = *(void**)(base + lua_interface_offset);
-    g_lua_interface = *(void**)lua_interface_offset;
+    // Thực hiện hook Init (bạn cần có hàm hook member function)
+    // Nếu bạn đã có MinHook hoặc subhook, dùng như sau:
+    // MH_CreateHook((LPVOID)orig_Init, hooked_Init, (LPVOID*)&orig_Init_real);
+    // MH_EnableHook((LPVOID)orig_Init);
 
-    // Kiểm tra đơn giản
-    if (g_lua_interface && HookEngine::is_executable_memory((void*)((uintptr_t)g_lua_interface + 0x10))) {
-        LOG("LuaInterface resolved thành công: %p (base + 0x%lx)", 
-            g_lua_interface, lua_interface_offset);
+    // Nếu chưa có lib hook, dùng cách tạm thời: gọi resolve ở constructor và giả định Init được gọi nhiều lần
+    // Hoặc implement patch byte đơn giản (dùng patch_code_safe nếu bạn có)
+
+    // Giả sử bạn có hàm hook_function(void* target, void* detour) → thay bằng:
+    // hook_function((void*)orig_Init, (void*)hooked_Init);  // Nếu là free func, nhưng đây là member → cần adjust
+
+    g_init_hooked = true;
+    LOG("LuaInterface::Init đã được hook thành công (chờ gọi để lấy this)");
+}
+// Detour cho LuaInterface::Init(Scene*)
+void hooked_Init(LuaInterface* this_ptr, Scene* scene) {
+    // Gọi hàm gốc trước (để server chạy bình thường)
+    if (orig_Init) {
+        (this_ptr->*orig_Init)(scene);
+    }
+
+    // Lưu LuaInterface* this một lần (thường mỗi Scene có một, nhưng ta lấy cái đầu tiên hoặc last)
+    if (g_lua_interface.load() == nullptr) {
+        g_lua_interface.store(this_ptr);
+        LOG("[hooked_Init] Lưu LuaInterface* = %p (Scene = %p)", this_ptr, scene);
+    }
+
+    // Thử lấy lua_State* từ các offset phổ biến trong TLBB leak
+    static const uintptr_t offsets[] = {0x4, 0x8, 0x10, 0x18, 0x20, 0x58, 0x60, 0x68};
+    lua_State* candidate = nullptr;
+
+    for (size_t i = 0; i < sizeof(offsets)/sizeof(offsets[0]); ++i) {
+        uintptr_t off = offsets[i];
+        lua_State** pp = (lua_State**)((uintptr_t)this_ptr + off);
+        if (pp && *pp && lua_gettop(*pp) >= 0 && lua_isstring(*pp, -1) == 0) {  // check state hợp lệ
+            candidate = *pp;
+            LOG("[hooked_Init] Phát hiện lua_State* = %p tại offset 0x%lx", candidate, off);
+            break;
+        }
+    }
+
+    if (candidate) {
+        g_lua_state.store(candidate);
     } else {
-        LOG("LuaInterface không hợp lệ tại offset 0x%lx - kiểm tra lại Ghidra", lua_interface_offset);
-        g_lua_interface = nullptr;
+        LOG("[hooked_Init] Không tìm thấy lua_State* - cần reverse offset chính xác bằng IDA/Ghidra");
     }
 }
+
 // Biến toàn cục
 static void* g_exe_script_ddddddddddd = nullptr;
 
@@ -825,6 +894,26 @@ void TriggerLuaEventExtended_Hook(
     int p1, int p2, int p3, int p4, int p5,
     int p6, int p7, int p8, int p9, int p10, int p11
 ) {
+
+	// Trong TriggerLuaEventExtended_Hook (hoặc hàm tương ứng)
+	LuaInterface* lua_interface = g_lua_interface.load();
+	if (lua_interface == nullptr) {
+		LOG("TriggerLuaEventExtended_Hook: g_lua_interface vẫn NULL! (Init chưa được gọi hoặc hook fail)");
+		// Có thể fallback gọi orig_...
+		return orig_TriggerLuaEventExtended(params...);
+	}
+
+	lua_State* L = g_lua_state.load();
+	if (L == nullptr) {
+		LOG("TriggerLuaEventExtended_Hook: lua_State NULL dù có LuaInterface!");
+		return orig_TriggerLuaEventExtended(params...);
+	}
+
+	// Bây giờ dùng được
+	LOG("TriggerLuaEventExtended_Hook: OK - LuaInterface = %p, lua_State = %p", lua_interface, L);
+
+	// Tiếp tục logic của bạn: push params, lua_getglobal(L, "LuaFnEquipTransToNew"), lua_call...
+
     if (!g_exe_script_ddddddddddd) {
         LOG("Chưa resolve được ExeScript func");
         return;
@@ -1105,7 +1194,7 @@ pthread_once_t ServerHook::once_control = PTHREAD_ONCE_INIT;
 __attribute__((constructor))
 void init() {
 	//resolve_exe_script_func(); //ExeScript_DDDDDDDDDDD
-	//resolve_lua_interface(); // chưa có offset hoặc dlsym chưa dùng đượcs
+	resolve_lua_interface();  // Gọi để dlsym Init
     // Chỉ khởi tạo instance, đảm bảo thread-safe
     ServerHook::getInstance();
 }
