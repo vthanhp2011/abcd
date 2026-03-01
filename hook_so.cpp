@@ -20,16 +20,11 @@
 #include <thread>
 #include <atomic>          // cho std::atomic
 // Thay bằng (include 3 header chuẩn Lua 5.1)
-// Đã có từ trước (giữ nguyên nếu có)
-#include "lua.h"
-#include "lauxlib.h"
-#include "lualib.h"
-
-
-// Forward declare (đã có hoặc thêm nếu thiếu)
-class LuaInterface;
-class Scene;
-
+extern "C" {
+    #include "lua.h"
+    #include "lauxlib.h"
+    #include "lualib.h"
+}
 
 #define HOOK_STUB_SIZE 14
 #define TRAMPOLINE_COPY_SIZE 32
@@ -43,7 +38,13 @@ class Scene;
 //sudo apt install build-essential
 //g++ -shared -fPIC -O2 -std=c++14 -pthread hook_so.cpp -ldl -o hook_so.so
 //g++ -shared -fPIC -O2 -std=c++14 -pthread -fpermissive hook_so.cpp -ldl -o hook_so.so
-
+//g++ -shared -fPIC -O2 -std=c++14 -pthread \
+    -I/home/tlbb/Server/include \
+    hook_so.cpp \
+    -L. -lLuaLib \
+    -ldl \
+    -o hook_so.so
+	
 /* ============================================================
    CẤU HÌNH
 ============================================================ */
@@ -52,6 +53,19 @@ static std::atomic<bool> g_enable_log{true};
 static const char* LOG_PATH = "/home/tlbb/Server/Log/";
 
 static pthread_mutex_t g_patch_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+
+// Global cho LuaInterface và lua_State
+class LuaInterface;  // forward declare
+class Scene;         // forward declare
+std::atomic<LuaInterface*> g_lua_interface{nullptr};
+std::atomic<lua_State*>    g_lua_state{nullptr};
+// Typedef member function pointer
+typedef void (LuaInterface::*InitFn)(Scene*);
+// Biến static cho orig_Init (member pointer)
+static InitFn orig_Init = nullptr;
+static bool g_init_hooked = false;
+
 
 /* ============================================================
    LOGGER TIÊN TIẾN - THREAD SAFE, KHÔNG BLOCK - CÓ THỜI GIAN
@@ -185,10 +199,7 @@ struct GlobalPointers {
 	std::atomic<void*> g_ItemTable_GetBlueItemTB_Func{nullptr};
 	std::atomic<void*> g_NotifyEquipAttr_Func{nullptr};
 	std::atomic<void*> g_RandomAttrRate_Func{nullptr};  // nếu có hàm random riêng
-	//
-	// Sửa hoặc thêm mới (thay thế nếu bạn đã khai báo sai kiểu void*)
-	std::atomic<LuaInterface*> g_lua_interface{nullptr};
-	std::atomic<lua_State*>    g_lua_state{nullptr};	
+
 };
 
 static GlobalPointers g_globals;
@@ -736,12 +747,6 @@ static pthread_mutex_t g_lua_mutex = PTHREAD_MUTEX_INITIALIZER;
 typedef struct lua_State lua_State;
 typedef int (*lua_CFunction)(lua_State *L);
 
-// Typedef cho member function pointer (giữ nguyên hoặc thêm)
-typedef void (LuaInterface::*InitFn)(Scene*);
-static InitFn orig_Init = nullptr;
-
-static bool g_init_hooked = false;
-
 
 //khai báo
 extern "C" {
@@ -805,25 +810,24 @@ extern "C" {
 
 void resolve_lua_interface() {
     if (g_lua_interface.load() != nullptr) {
-        return;  // Đã resolve rồi
-    }
-
-	
-    void* sym = dlsym(RTLD_NEXT, "_ZN12LuaInterface4InitEP5Scene");
-    if (sym == nullptr) {
-        LOG("Không tìm thấy symbol LuaInterface::Init");
         return;
     }
 
-    // Cast đúng kiểu member function pointer
-    // Lưu ý: cast này hợp lệ ở hầu hết compiler, nhưng không phải lúc nào cũng an toàn 100%
-    orig_Init = reinterpret_cast<InitFn>(sym);
+    void* sym = dlsym(RTLD_NEXT, "_ZN12LuaInterface4InitEP5Scene");
+    if (sym == nullptr) {
+        LOG("Không tìm thấy symbol _ZN12LuaInterface4InitEP5Scene");
+        return;
+    }
 
-    LOG("Tìm thấy LuaInterface::Init tại %p", sym);
+    // Không cast trực tiếp reinterpret_cast cho member pointer (GCC báo lỗi)
+    // Thay vào đó lưu sym như void* trước, chỉ dùng khi hook thật (sau)
+    // Hiện tại chỉ log để test
+    LOG("Tìm thấy LuaInterface::Init tại %p - chờ implement hook thật", sym);
 
-    // Ở đây chưa hook thật (chỉ dlsym). Hook thật cần MinHook hoặc patch byte.
-    // Nếu bạn chưa có hook, tạm thời dùng để test khi Init được gọi ở chỗ khác.
-    // Sau này thêm hook nếu cần intercept call Init.
+    // Để hook thật: bạn cần dùng MinHook hoặc patch byte tại địa chỉ sym
+    // Ví dụ nếu dùng MinHook (thêm sau nếu bạn cài):
+    // MH_CreateHook(sym, (void*)hooked_Init, (void**)&orig_Init_real);
+    // MH_EnableHook(sym);
 
     g_init_hooked = true;
 }
@@ -906,30 +910,21 @@ void TriggerLuaEventExtended_Hook(
     int p6, int p7, int p8, int p9, int p10, int p11
 ) {
 
-	// Trong TriggerLuaEventExtended_Hook (hoặc hàm tương ứng)
 	LuaInterface* lua_interface = g_lua_interface.load();
-	if (lua_interface == nullptr) {
-		LOG("TriggerLuaEventExtended_Hook: LuaInterface NULL - có thể Init chưa được gọi hoặc hook chưa hoạt động");
-		// Gọi hàm gốc nếu có
-		if (orig_TriggerLuaEventExtended) {
-			return orig_TriggerLuaEventExtended( /* truyền đủ các tham số gốc */ );
-		}
-		return 0;  // hoặc giá trị default phù hợp
-	}
+    if (lua_interface == nullptr) {
+        LOG("TriggerLuaEventExtended_Hook: LuaInterface NULL");
+        return;  // Không return giá trị
+    }
 
-	lua_State* L = g_lua_state.load();
-	if (L == nullptr) {
-		LOG("TriggerLuaEventExtended_Hook: lua_State NULL dù có LuaInterface");
-		if (orig_TriggerLuaEventExtended) {
-			return orig_TriggerLuaEventExtended( /* params */ );
-		}
-		return 0;
-	}
+    lua_State* L = g_lua_state.load();
+    if (L == nullptr) {
+        LOG("TriggerLuaEventExtended_Hook: lua_State NULL");
+        return;  // Không return giá trị
+    }
 
-	// OK, tiếp tục dùng lua_interface và L
-	LOG("TriggerLuaEventExtended_Hook OK - LuaInterface %p | lua_State %p", lua_interface, L);
-	// Tiếp tục logic của bạn: push params, lua_getglobal(L, "LuaFnEquipTransToNew"), lua_call...
-
+    // OK, dùng được
+    LOG("TriggerLuaEventExtended_Hook OK - LuaInterface %p | lua_State %p", lua_interface, L);
+	
     if (!g_exe_script_ddddddddddd) {
         LOG("Chưa resolve được ExeScript func");
         return;
@@ -957,6 +952,7 @@ void TriggerLuaEventExtended_Hook(
         p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11
     );
 
+	
     LOG("Gọi thành công ExeScript | script=%u | event=%s | result=%lld",
         script_id, event_name, result);
 }
@@ -1086,8 +1082,8 @@ int FoxRegisterFunction_Hook(void* this_ptr, const char* func_name, void* func_p
                 lua_CFunction func;
             } luaFunctions[] = {
                 // ===== THÊM CÁC HÀM LUA CỦA BẠN VÀO ĐÂY =====
-                //{"LuaFnGetAccountName", LuaFnGetAccountName},
-                //{"LuaFnEquipTransToNew", LuaFnEquipTransToNew},
+                {"LuaFnGetAccountName", LuaFnGetAccountName},
+                {"LuaFnEquipTransToNew", LuaFnEquipTransToNew},
                 // =============================================
             };
             
