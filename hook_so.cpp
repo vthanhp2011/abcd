@@ -21,9 +21,9 @@
 
 // khai bao lua 5.0.1 - 5.0.3
 extern "C" {
-	#include "lua.h"
-	#include "lauxlib.h"
-	#include "lualib.h"
+    #include "lua.h"
+    #include "lauxlib.h"   // chứa lua_setfield, lua_setglobal, lua_gettop, v.v.
+    #include "lualib.h"
 }
 
 class LuaInterface;
@@ -806,27 +806,21 @@ extern "C" {
 }
 
 void resolve_lua_interface() {
-    uintptr_t base = get_module_base("Server");
-    if (!base) {
-        LOG("Không tìm thấy base address của Server");
-        return;
-    }
+    if (g_lua_interface.load() != nullptr) return;
 
-    // THAY OFFSET NÀY BẰNG OFFSET THỰC TỪ GHIDRA
-    uintptr_t lua_interface_offset = 0x2B4C80;  // <-- OFFSET BẠN TÌM ĐƯỢC
+    // Nếu bạn dùng offset hardcode (ví dụ từ IDA)
+    uintptr_t base = (uintptr_t)dlopen(NULL, RTLD_LAZY);  // base của main binary
+    uintptr_t lua_interface_offset = base + 0x123456;     // THAY BẰNG OFFSET THẬT BẠN TÌM ĐƯỢC
 
-    //g_lua_interface = *(void**)(base + lua_interface_offset);
-    g_lua_interface = *(void**)lua_interface_offset;
-
-    // Kiểm tra đơn giản
-    if (g_lua_interface && HookEngine::is_executable_memory((void*)((uintptr_t)g_lua_interface + 0x10))) {
-        LOG("LuaInterface resolved thành công: %p (base + 0x%lx)", 
-            g_lua_interface, lua_interface_offset);
+    LuaInterface* ptr = *(LuaInterface**)lua_interface_offset;
+    if (ptr) {
+        g_lua_interface.store(ptr);
+        LOG("resolve_lua_interface: Lưu LuaInterface* từ offset = %p", ptr);
     } else {
-        LOG("LuaInterface không hợp lệ tại offset 0x%lx - kiểm tra lại Ghidra", lua_interface_offset);
-        g_lua_interface = nullptr;
+        LOG("resolve_lua_interface: Không tìm thấy LuaInterface từ offset");
     }
 }
+
 // Biến toàn cục
 static void* g_exe_script_ddddddddddd = nullptr;
 
