@@ -1041,9 +1041,8 @@ void TriggerLuaEventExtended_Hook(
         (int)(scene), \
         (int)(self), \
         (int)(target), \
-        -1, 0, 0, 0, 0, 0, 0, 0, 0, 0 \
+        -1, 0, 0, 0, 0, 0, 0, 0 \
     )
-
 // Sử dụng
 //TRIGGER_LUA_EVENT(2116, "OnDefaultEvent", scene_id, obj_id, obj_id);
 
@@ -1096,9 +1095,7 @@ extern "C" int LuaFnEquipTransToNew(lua_State *L) {
         lua_pushnumber(L, -1.0);
         return 1;
     }
-	
-	TRIGGER_LUA_EVENT(2116, "OnDefaultEvent", scene_id, obj_id, obj_id);
-	
+		
     LOG("EquipTransToNew success (placeholder offsets)");
     lua_pushnumber(L, 1.0);
     return 1;
@@ -1167,7 +1164,7 @@ private:
 			if (trampoline) {
 				g_orig_FoxRegisterFunction = (FoxLuaScript_RegisterFunction_t)trampoline;
 				LOG("Patching...");
-				LOG("Patching TriggerLuaEventExtended at addr %p to hook %p", fox_addr, (void*)TriggerLuaEventExtended_Hook);
+				//LOG("Patching TriggerLuaEventExtended at addr %p to hook %p", fox_addr, (void*)TriggerLuaEventExtended_Hook);
 				HookEngine::patch_code_safe(fox_addr, (void*)FoxRegisterFunction_Hook);
 				//HookEngine::patch_code_safe(fox_addr, (void*)TriggerLuaEventExtended_Hook);  // hoặc FoxRegisterFunction_Hook
 				
