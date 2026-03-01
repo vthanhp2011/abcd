@@ -1091,7 +1091,7 @@ int64_t skill005_hook(void* _this, unsigned int* a2, int a3) {
    HÀM ScriptGlobal_Format
 ============================================================ */
 
-typedef int64_t (*ScriptGlobal_Format_t)(
+typedef int64_t (*ScriptGlobal_Format_tt)(
     char* dest,
     int len,
     const char* fmt,
@@ -1099,7 +1099,7 @@ typedef int64_t (*ScriptGlobal_Format_t)(
     ...
 );
 
-static ScriptGlobal_Format_t g_orig_ScriptGlobal_Format = nullptr;
+static ScriptGlobal_Format_tt g_orig_ScriptGlobal_Formatt = nullptr;
 static void* g_trampoline = nullptr;
 
 int64_t ScriptGlobal_Format_Hook(
@@ -1254,7 +1254,6 @@ int64_t ScriptGlobal_Format_Hook(
 using LuaFnScriptGlobal_Format_t = int64_t (*)(lua_State*);
 
 static LuaFnScriptGlobal_Format_t g_orig_LuaFnScriptGlobal_Format = nullptr;
-static ScriptGlobal_Format_t      g_ScriptGlobal_Format = nullptr;
 
 // ==========================================================
 // HOOK FUNCTION
@@ -1262,98 +1261,26 @@ static ScriptGlobal_Format_t      g_ScriptGlobal_Format = nullptr;
 extern "C"
 int64_t LuaFnScriptGlobal_Format_Hook(lua_State* L)
 {
+    LOG("========== LuaFnScriptGlobal_Format_Hook ==========");
+
     if (!L)
         return 0;
 
     int top = lua_gettop(L);
-    if (top < 1)
+    LOG("lua_gettop = %d", top);
+
+    for (int i = 1; i <= top; ++i)
     {
-        lua_pushstring(L, "");
-        return 1;
+        int t = lua_type(L, i);
+        LOG("Stack[%d] type = %s",
+            i, lua_typename(L, t));
     }
 
-    const char* key = lua_tostring(L, 1);
-    if (!key)
-        key = "";
+    LOG("SKIP ORIGINAL -> RETURN 0");
 
-    int paramCount = top - 1;
-
-    // Nếu không có param -> return key
-    if (paramCount <= 0)
-    {
-        lua_pushstring(L, key);
-        return 1;
-    }
-
-    if (paramCount > 9)
-        paramCount = 9; // giới hạn như bản gốc
-
-    char dest[320];
-    memset(dest, 0, sizeof(dest));
-
-    // Thu thập param string an toàn
-    const char* args[9] = {0};
-
-    for (int i = 0; i < paramCount; ++i)
-    {
-        if (lua_type(L, i + 2) == LUA_TNIL)
-        {
-            args[i] = "";
-        }
-        else
-        {
-            const char* s = lua_tostring(L, i + 2);
-            args[i] = s ? s : "";
-        }
-    }
-
-    // Gọi ScriptGlobal_Format an toàn theo số param
-    int ok = 0;
-
-    switch (paramCount)
-    {
-        case 1:
-            ok = g_ScriptGlobal_Format(dest, 320, key, 1, args[0]);
-            break;
-        case 2:
-            ok = g_ScriptGlobal_Format(dest, 320, key, 2, args[0], args[1]);
-            break;
-        case 3:
-            ok = g_ScriptGlobal_Format(dest, 320, key, 3, args[0], args[1], args[2]);
-            break;
-        case 4:
-            ok = g_ScriptGlobal_Format(dest, 320, key, 4, args[0], args[1], args[2], args[3]);
-            break;
-        case 5:
-            ok = g_ScriptGlobal_Format(dest, 320, key, 5, args[0], args[1], args[2], args[3], args[4]);
-            break;
-        case 6:
-            ok = g_ScriptGlobal_Format(dest, 320, key, 6, args[0], args[1], args[2], args[3], args[4], args[5]);
-            break;
-        case 7:
-            ok = g_ScriptGlobal_Format(dest, 320, key, 7, args[0], args[1], args[2], args[3], args[4], args[5], args[6]);
-            break;
-        case 8:
-            ok = g_ScriptGlobal_Format(dest, 320, key, 8, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]);
-            break;
-        case 9:
-            ok = g_ScriptGlobal_Format(dest, 320, key, 9, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8]);
-            break;
-        default:
-            ok = 0;
-            break;
-    }
-
-    if (!ok)
-    {
-        snprintf(dest, sizeof(dest),
-                 "FORMAT_ERROR: Key=%s ParamNum=%d",
-                 key, paramCount);
-    }
-
-    lua_pushstring(L, dest);
-    return 1;
+    return 0;
 }
+
 /* ============================================================
    INITIALIZATION - THREAD SAFE, CHỈ 1 LẦN
 ============================================================ */
@@ -1421,7 +1348,7 @@ private:
 				return;
 			}
 
-			g_orig_ScriptGlobal_Format = (ScriptGlobal_Format_t)g_trampoline;
+			g_orig_ScriptGlobal_Formatt = (ScriptGlobal_Format_tt)g_trampoline;
 
 			HookEngine::patch_code_safe(
 				(void*)target,
@@ -1442,8 +1369,8 @@ private:
 			uintptr_t offset = 0x8CF6E0;  // offset bạn cung cấp
 
 			LOG("LuaFnScriptGlobal_Format runtime addr: %p", (void*)offset);
-/*
-			g_trampoline = HookEngine::create_trampoline((void*)offset, 64);
+
+			g_trampoline = HookEngine::create_trampoline((void*)offset, 32);
 			if (!g_trampoline)
 			{
 				LOG("create_trampoline failed");
@@ -1453,7 +1380,7 @@ private:
 			// ⚠ Kiểu phải đúng prototype
 			g_orig_LuaFnScriptGlobal_Format =
 				(LuaFnScriptGlobal_Format_t)g_trampoline;
-*/
+
 			HookEngine::patch_code_safe(
 				(void*)offset,
 				(void*)LuaFnScriptGlobal_Format_Hook
