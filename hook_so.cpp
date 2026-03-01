@@ -18,12 +18,12 @@
 #include <memory>
 #include <cstdint>
 #include <thread>
-#include <atomic>          // cho std::atomic
-// Thay bằng (include 3 header chuẩn Lua 5.1)
+
+// khai bao lua 5.0.3
 extern "C" {
-    #include "lua.h"
-    #include "lauxlib.h"
-    #include "lualib.h"
+	#include "lua.h"
+	#include "lauxlib.h"
+	#include "lualib.h"
 }
 
 #define HOOK_STUB_SIZE 14
@@ -38,13 +38,13 @@ extern "C" {
 //sudo apt install build-essential
 //g++ -shared -fPIC -O2 -std=c++14 -pthread hook_so.cpp -ldl -o hook_so.so
 //g++ -shared -fPIC -O2 -std=c++14 -pthread -fpermissive hook_so.cpp -ldl -o hook_so.so
+
 //g++ -shared -fPIC -O2 -std=c++14 -pthread \
-    -I/home/tlbb/Server/include \
+    -I/home/tlbb/Server/Lua \
     hook_so.cpp \
     -L. -lLuaLib \
     -ldl \
     -o hook_so.so
-	
 /* ============================================================
    CẤU HÌNH
 ============================================================ */
@@ -53,19 +53,6 @@ static std::atomic<bool> g_enable_log{true};
 static const char* LOG_PATH = "/home/tlbb/Server/Log/";
 
 static pthread_mutex_t g_patch_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-
-// Global cho LuaInterface và lua_State
-class LuaInterface;  // forward declare
-class Scene;         // forward declare
-std::atomic<LuaInterface*> g_lua_interface{nullptr};
-std::atomic<lua_State*>    g_lua_state{nullptr};
-// Typedef member function pointer
-typedef void (LuaInterface::*InitFn)(Scene*);
-// Biến static cho orig_Init (member pointer)
-static InitFn orig_Init = nullptr;
-static bool g_init_hooked = false;
-
 
 /* ============================================================
    LOGGER TIÊN TIẾN - THREAD SAFE, KHÔNG BLOCK - CÓ THỜI GIAN
@@ -199,6 +186,7 @@ struct GlobalPointers {
 	std::atomic<void*> g_ItemTable_GetBlueItemTB_Func{nullptr};
 	std::atomic<void*> g_NotifyEquipAttr_Func{nullptr};
 	std::atomic<void*> g_RandomAttrRate_Func{nullptr};  // nếu có hàm random riêng
+	//
 
 };
 
@@ -746,7 +734,7 @@ static pthread_mutex_t g_lua_mutex = PTHREAD_MUTEX_INITIALIZER;
 // Định nghĩa các hàm Lua cần thiết nếu không có header
 typedef struct lua_State lua_State;
 typedef int (*lua_CFunction)(lua_State *L);
-
+static void* g_lua_interface = nullptr;          // LuaInterface*
 
 //khai báo
 extern "C" {
@@ -789,8 +777,8 @@ extern "C" {
     void* lua_newuserdata(lua_State *L, size_t nbytes);
 	
     int lua_isfunction(lua_State *L, int idx);
-}*/
-
+}
+*/
 /* ============================================================
    HÀM CALL SCRIPT
 ============================================================ */
@@ -809,64 +797,27 @@ extern "C" {
 }
 
 void resolve_lua_interface() {
-    if (g_lua_interface.load() != nullptr) {
+    uintptr_t base = get_module_base("Server");
+    if (!base) {
+        LOG("Không tìm thấy base address của Server");
         return;
     }
 
-    void* sym = dlsym(RTLD_NEXT, "_ZN12LuaInterface4InitEP5Scene");
-    if (sym == nullptr) {
-        LOG("Không tìm thấy symbol _ZN12LuaInterface4InitEP5Scene");
-        return;
-    }
+    // THAY OFFSET NÀY BẰNG OFFSET THỰC TỪ GHIDRA
+    uintptr_t lua_interface_offset = 0x2B4C80;  // <-- OFFSET BẠN TÌM ĐƯỢC
 
-    // Không cast trực tiếp reinterpret_cast cho member pointer (GCC báo lỗi)
-    // Thay vào đó lưu sym như void* trước, chỉ dùng khi hook thật (sau)
-    // Hiện tại chỉ log để test
-    LOG("Tìm thấy LuaInterface::Init tại %p - chờ implement hook thật", sym);
+    //g_lua_interface = *(void**)(base + lua_interface_offset);
+    g_lua_interface = *(void**)lua_interface_offset;
 
-    // Để hook thật: bạn cần dùng MinHook hoặc patch byte tại địa chỉ sym
-    // Ví dụ nếu dùng MinHook (thêm sau nếu bạn cài):
-    // MH_CreateHook(sym, (void*)hooked_Init, (void**)&orig_Init_real);
-    // MH_EnableHook(sym);
-
-    g_init_hooked = true;
-}
-
-
-void hooked_Init(LuaInterface* this_ptr, Scene* scene) {
-    // Gọi hàm gốc (syntax gọi member function pointer)
-    if (orig_Init) {
-        (this_ptr->*orig_Init)(scene);
-    }
-
-    // Lưu this_ptr nếu chưa có
-    if (g_lua_interface.load() == nullptr) {
-        g_lua_interface.store(this_ptr);
-        LOG("[hooked_Init] Lưu LuaInterface* = %p (Scene = %p)", this_ptr, scene);
-    }
-
-    // Thử tìm lua_State* bằng offset
-    static const uintptr_t offsets[] = {0x4, 0x8, 0x10, 0x18, 0x20, 0x58, 0x60, 0x68};
-    lua_State* L_candidate = nullptr;
-
-    for (auto off : offsets) {
-        lua_State** ppL = (lua_State**)((uintptr_t)this_ptr + off);
-        lua_State* possible_L = *ppL;
-        if (possible_L && lua_gettop(possible_L) >= 0) {  // check state có vẻ hợp lệ
-            L_candidate = possible_L;
-            LOG("[hooked_Init] Phát hiện lua_State* = %p tại offset 0x%lx", L_candidate, off);
-            break;
-        }
-    }
-
-    if (L_candidate) {
-        g_lua_state.store(L_candidate);
+    // Kiểm tra đơn giản
+    if (g_lua_interface && HookEngine::is_executable_memory((void*)((uintptr_t)g_lua_interface + 0x10))) {
+        LOG("LuaInterface resolved thành công: %p (base + 0x%lx)", 
+            g_lua_interface, lua_interface_offset);
     } else {
-        LOG("[hooked_Init] Không tìm thấy lua_State* - thử reverse offset bằng IDA");
+        LOG("LuaInterface không hợp lệ tại offset 0x%lx - kiểm tra lại Ghidra", lua_interface_offset);
+        g_lua_interface = nullptr;
     }
 }
-
-
 // Biến toàn cục
 static void* g_exe_script_ddddddddddd = nullptr;
 
@@ -909,22 +860,6 @@ void TriggerLuaEventExtended_Hook(
     int p1, int p2, int p3, int p4, int p5,
     int p6, int p7, int p8, int p9, int p10, int p11
 ) {
-
-	LuaInterface* lua_interface = g_lua_interface.load();
-    if (lua_interface == nullptr) {
-        LOG("TriggerLuaEventExtended_Hook: LuaInterface NULL");
-        return;  // Không return giá trị
-    }
-
-    lua_State* L = g_lua_state.load();
-    if (L == nullptr) {
-        LOG("TriggerLuaEventExtended_Hook: lua_State NULL");
-        return;  // Không return giá trị
-    }
-
-    // OK, dùng được
-    LOG("TriggerLuaEventExtended_Hook OK - LuaInterface %p | lua_State %p", lua_interface, L);
-	
     if (!g_exe_script_ddddddddddd) {
         LOG("Chưa resolve được ExeScript func");
         return;
@@ -952,7 +887,6 @@ void TriggerLuaEventExtended_Hook(
         p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11
     );
 
-	
     LOG("Gọi thành công ExeScript | script=%u | event=%s | result=%lld",
         script_id, event_name, result);
 }
@@ -1170,7 +1104,7 @@ private:
 		// Tạo thread riêng để hook skill sau 45 giây (không block thread chính)
 		std::thread([this]() {
 			//sleep(30); // Hoặc 
-			std::this_thread::sleep_for(std::chrono::seconds(45));
+			std::this_thread::sleep_for(std::chrono::seconds(35));
 			
 			void* skill_addr = dlsym(RTLD_DEFAULT, 
 				"_ZNK13Combat_Module12Skill_Module16CommonSkill005_T16EffectOnUnitOnceER13Obj_CharacterS3_i");
@@ -1205,8 +1139,8 @@ pthread_once_t ServerHook::once_control = PTHREAD_ONCE_INIT;
 ============================================================ */
 __attribute__((constructor))
 void init() {
-	resolve_exe_script_func(); //ExeScript_DDDDDDDDDDD
-	resolve_lua_interface();  // Gọi để dlsym Init
+	//resolve_exe_script_func(); //ExeScript_DDDDDDDDDDD
+	//resolve_lua_interface(); // chưa có offset hoặc dlsym chưa dùng đượcs
     // Chỉ khởi tạo instance, đảm bảo thread-safe
     ServerHook::getInstance();
 }
