@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdint.h>
 #include <dlfcn.h>
@@ -28,41 +30,54 @@ extern "C" {
 
 class LuaInterface;
 
-
 #define HOOK_STUB_SIZE 14
-#define TRAMPOLINE_COPY_SIZE 32
+//#define TRAMPOLINE_COPY_SIZE 32
 #define PAGE_ALIGN(addr) ((uintptr_t)(addr) & ~(sysconf(_SC_PAGESIZE) - 1))
 #define LOG_BUFFER_SIZE 1024
 #define MAX_HOOK_RETRY 3
 
+static size_t TRAMPOLINE_COPY_SIZE = 32;
 
 //build
 //sudo apt update
 //sudo apt install build-essential
 //g++ -shared -fPIC -O2 -std=c++14 -pthread hook_so.cpp -ldl -o hook_so.so
 //g++ -shared -fPIC -O2 -std=c++14 -pthread -fpermissive hook_so.cpp -ldl -o hook_so.so
+//g++ -shared -fPIC -O2 -std=c++14 -pthread -fpermissive -I/home/tlbb/Server/Lua hook_so.cpp -L. -lLuaLib -ldl -o hook_so.so
 
-//g++ -shared -fPIC -O2 -std=c++14 -pthread \
-    -I/home/tlbb/Server/Lua \
-    hook_so.cpp \
-    -L. -lLuaLib \
-    -ldl \
-    -o hook_so.so
+//g++ -shared -fPIC -O2 -std=c++14 \
+-I/home/tlbb/Server/Lua \
+hook_so.cpp \
+-ldl \
+-o hook_so.so
+
+//apt update
+//apt install g++-multilib gcc-multilib libc6-dev-i386
 /* ============================================================
    CẤU HÌNH
 ============================================================ */
 // Cấu hình runtime
 static std::atomic<bool> g_enable_log{true};
 static const char* LOG_PATH = "/home/tlbb/Server/Log/";
-
 static pthread_mutex_t g_patch_mutex = PTHREAD_MUTEX_INITIALIZER;
-// Đầu file: khai báo global (nếu chưa có)
-std::atomic<LuaInterface*> g_lua_interface{nullptr};
-std::atomic<lua_State*>    g_lua_state{nullptr};
-
 // Typedef cho hàm gốc (nếu bạn hook bằng member pointer)
 typedef void (LuaInterface::*RegFn)();
 static RegFn orig_FoxRegisterFunction = nullptr;
+// Định nghĩa các hàm Lua cần thiết nếu không có header
+// ===== Forward declare Lua =====
+extern "C" {
+    typedef struct lua_State lua_State;
+}
+typedef int (*lua_CFunction)(lua_State *L);
+typedef int (*FoxLuaScript_RegisterFunction_t)(void* this_ptr, const char* func_name, void* func_ptr);
+static FoxLuaScript_RegisterFunction_t g_orig_FoxRegisterFunction = nullptr;
+static std::atomic<bool> g_lua_injected{false};
+static pthread_mutex_t g_lua_mutex = PTHREAD_MUTEX_INITIALIZER;
+static void* g_exe_script_ddddddddddd = nullptr;
+//skill005_hook
+typedef int (*GetExteriorRideMaxSpeed_Type)(void*);
+typedef int (*SendImpactToUnit_Type)(void*, void*, unsigned short, unsigned int, int, int);
+
 
 /* ============================================================
    LOGGER TIÊN TIẾN - THREAD SAFE, KHÔNG BLOCK - CÓ THỜI GIAN
@@ -190,30 +205,10 @@ struct GlobalPointers {
     std::atomic<void*> ImpactCore_ptr{nullptr};
     std::atomic<void*> GetExteriorRideMaxSpeed{nullptr};
     std::atomic<void*> SendImpactToUnit{nullptr};
-	// Global pointers (thêm vào struct GlobalPointers g_globals)
-	std::atomic<void*> g_GetScene_Func{nullptr};
-	std::atomic<void*> g_HumanItemLogic_GetItem_Func{nullptr};
-	std::atomic<void*> g_ItemTable_GetBlueItemTB_Func{nullptr};
-	std::atomic<void*> g_NotifyEquipAttr_Func{nullptr};
-	std::atomic<void*> g_RandomAttrRate_Func{nullptr};  // nếu có hàm random riêng
-	//
 
 };
 
 static GlobalPointers g_globals;
-
-// Random functions (sub_804xxxx → thay bằng rand() hoặc server random)
-typedef int (*RandomFunc_Type)(int min, int max);  // giả định sub_804AE90() % 10 + 1
-
-// Thay vì typedef cụ thể, dùng void* để compile
-typedef void* (*GetScene_Type)(int scene_id);
-typedef void* (*HumanItemLogic_GetItem_Type)(void* human, int bag_index);
-typedef void* (*ItemTable_GetBlueItemTB_Type)(void* table, int serial);
-typedef void (*NotifyEquipAttr_Type)(void* human, int bag_index, void* item);
-
-//skill005_hook
-typedef int (*GetExteriorRideMaxSpeed_Type)(void*);
-typedef int (*SendImpactToUnit_Type)(void*, void*, unsigned short, unsigned int, int, int);
 
 /* ============================================================
    MEMORY PROTECTION UTILITIES - AN TOÀN CHO MULTITHREADING
@@ -381,42 +376,52 @@ public:
 		pthread_mutex_unlock(&g_patch_mutex);
 	}
 	
-	static void* create_trampoline(void* target) {
+	static void* create_trampoline(void* target, size_t TRAMPOLINE_COPY_SIZE)
+	{
 		if (!target) return nullptr;
-		
+
 		std::lock_guard<std::mutex> lock(*(std::mutex*)&hook_mutex);
-		
+
 		void* trampoline = mmap(nullptr, 4096,
-								 PROT_READ | PROT_WRITE | PROT_EXEC,
-								 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-		if (trampoline == MAP_FAILED) {
+								PROT_READ | PROT_WRITE | PROT_EXEC,
+								MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+		if (trampoline == MAP_FAILED)
+		{
 			LOG("ERROR: Khong the tao trampoline: %s", strerror(errno));
 			return nullptr;
 		}
-		
-		// Copy toàn bộ code gốc (bao gồm cả lệnh JMP nếu có)
+
+		// Copy code gốc
 		memcpy(trampoline, target, TRAMPOLINE_COPY_SIZE);
-		
+
 		uint8_t* code = (uint8_t*)target;
-		// Nếu là lệnh JMP (opcode 0xE9), cần fix offset cho vị trí mới
-		if (code[0] == 0xE9) {
+
+		// Fix JMP nếu byte đầu là E9
+		if (code[0] == 0xE9)
+		{
 			int32_t rel_offset = *(int32_t*)(code + 1);
 			uint64_t dest = (uint64_t)target + 5 + rel_offset;
+
 			uint64_t tramp_start = (uint64_t)trampoline;
 			int32_t new_offset = (int32_t)(dest - (tramp_start + 5));
+
 			*(int32_t*)((uint8_t*)trampoline + 1) = new_offset;
+
 			LOG("Fixed JMP offset: old=%d, new=%d", rel_offset, new_offset);
 		}
-		
-		// Tạo jump về phần code gốc sau trampoline (phần chưa copy)
+
+		// Jump về phần còn lại của code gốc
 		uint8_t* p = (uint8_t*)trampoline + TRAMPOLINE_COPY_SIZE;
-		p[0] = 0x48;               // mov rax, ...
+
+		p[0] = 0x48;               // mov rax, addr
 		p[1] = 0xB8;
 		*(uint64_t*)(p + 2) = (uint64_t)((uint8_t*)target + TRAMPOLINE_COPY_SIZE);
 		p[10] = 0xFF;              // jmp rax
 		p[11] = 0xE0;
-		
+
 		trampolines.push_back(trampoline);
+
 		return trampoline;
 	}
     
@@ -504,23 +509,371 @@ static void resolve_symbols() {
     g_globals.SendImpactToUnit.store(
         dlsym(RTLD_DEFAULT, "_ZNK13Combat_Module13Impact_Module12ImpactCore_T16SendImpactToUnitER13Obj_Charactertiiiii"),
         std::memory_order_release);
-		
-	// chưa dùng đến
-	// Resolve các hàm cần cho EquipTransToNew
-	g_globals.g_GetScene_Func.store(dlsym(RTLD_DEFAULT, "_ZN12SceneManager12GetSceneInfoEs"));  // mangled name có thể khác
-	if (!g_globals.g_GetScene_Func.load()) {
-		// Fallback offset nếu cần (từ IDA)
-		LOG("GetScene not found - need manual offset");
-	}
-	g_globals.g_HumanItemLogic_GetItem_Func.store(dlsym(RTLD_DEFAULT, "_ZN13ItemContainer7GetItemEi"));
-    g_globals.g_ItemTable_GetBlueItemTB_Func.store((void*)0xBDF800,std::memory_order_release);
-	g_globals.g_NotifyEquipAttr_Func.store(dlsym(RTLD_DEFAULT, "xyzServerNotifyEquipAttr"));  // nếu export
-	// end
+
 
 }
 
 /* ============================================================
    HÀM HOOK CHÍNH - TỐI ƯU, CHECK NULL, THREAD SAFE
+============================================================ */
+//lay ra ham lua co tren sv strings ./libLuaLib.so | grep -i '^lua_' | sort | uniq > lua_symbols.txt
+//g++ -shared -fPIC -O2 -std=c++14 -pthread \
+    -I/usr/include/lua5.1 \
+    hook_so.cpp -ldl -o hook_so.so
+//strings ./Server | grep -i TriggerLuaEventExtended  > TriggerLuaEventExtended.txt
+//strings ./Server | grep -i -C 10 "TriggerLuaEventExtended" > TriggerLuaEventExtended.txt
+//strings ./Server | grep -i "LuaFnTbl\|BeginEvent\|AddText\|AddNumber\|CallScriptFunction" > lua_cpp2.txt
+/* ============================================================
+   FOXLUA SCRIPT REGISTER FUNCTION - THEO PSEUDOCODE
+============================================================ */
+
+
+//khai báo
+extern "C" {
+    int LuaFnGetAccountName(lua_State *L);
+    int LuaFnEquipTransToNew(lua_State *L);
+    // ... thêm các hàm khác
+}
+/*
+// Các hàm Lua thường dùng
+extern "C" {
+
+    // Forward declare lua_State nếu không include lua.h
+    typedef struct lua_State lua_State;
+
+    // =========================
+    // Core stack operations
+    // =========================
+    int lua_gettop(lua_State *L);
+    void lua_settop(lua_State *L, int idx);
+
+    // =========================
+    // Type checking
+    // =========================
+    int lua_isnumber(lua_State *L, int idx);
+    int lua_isstring(lua_State *L, int idx);
+    int lua_isfunction(lua_State *L, int idx);
+    int lua_type(lua_State *L, int idx);
+    const char* lua_typename(lua_State *L, int tp);
+
+    // =========================
+    // Conversion
+    // =========================
+    double lua_tonumber(lua_State *L, int idx);
+    const char* lua_tostring(lua_State *L, int idx);
+
+    // lauxlib (Lua 5.0.1)
+    const char* luaL_checkstring(lua_State *L, int idx);
+    double luaL_checknumber(lua_State *L, int idx);
+    int luaL_error(lua_State *L, const char* fmt, ...);
+
+    // =========================
+    // Push values
+    // =========================
+    void lua_pushnil(lua_State *L);
+    void lua_pushnumber(lua_State *L, double n);
+    void lua_pushstring(lua_State *L, const char* s);
+    void lua_pushlstring(lua_State *L, const char* s, size_t len);
+    void lua_pushvalue(lua_State *L, int idx);
+
+    // =========================
+    // Global access
+    // =========================
+    void lua_getglobal(lua_State *L, const char* name);
+    void lua_setglobal(lua_State *L, const char* name);
+
+    // =========================
+    // Call functions
+    // =========================
+    void lua_call(lua_State *L, int nargs, int nresults);
+    int lua_pcall(lua_State *L, int nargs, int nresults, int errfunc);
+
+    // =========================
+    // Table / userdata
+    // =========================
+    void lua_newtable(lua_State *L);
+    void* lua_newuserdata(lua_State *L, size_t nbytes);
+
+}
+*/
+
+/* ============================================================
+   HÀM CALL SCRIPT
+============================================================ */
+
+extern "C" {
+    // ... các extern khác
+
+    // Bỏ __fastcall và __int64, dùng long long
+    long long _ZN12LuaInterface21ExeScript_DDDDDDDDDDDEiPKciiiiiiiiiii(
+        void* this_ptr,
+        unsigned int script_id,
+        const char *event_name,
+        int p1, int p2, int p3, int p4, int p5,
+        int p6, int p7, int p8, int p9, int p10, int p11
+    );
+}
+
+
+// Resolve hàm (dlsym ưu tiên + offset fallback)
+void resolve_exe_script_func() {
+    // Cách 1: dlsym (thử tên mangled chính xác)
+    void* handle = dlopen(NULL, RTLD_LAZY | RTLD_GLOBAL);
+    if (handle) {
+        g_exe_script_ddddddddddd = dlsym(handle, "_ZN12LuaInterface21ExeScript_DDDDDDDDDDDEiPKciiiiiiiiiii");
+        if (g_exe_script_ddddddddddd) {
+            LOG("Tìm thấy ExeScript_DDDDDDDDDDD qua dlsym: %p", g_exe_script_ddddddddddd);
+            dlclose(handle);
+            return;
+        }
+        dlclose(handle);
+    }
+
+    // Cách 2: fallback offset cứng
+    uintptr_t base = get_module_base("Server");
+    if (base) {
+        uintptr_t func_offset = 0x96b8c4;
+        //g_exe_script_ddddddddddd = (void*)(base + func_offset);
+        g_exe_script_ddddddddddd = (void*)func_offset;
+        if (g_exe_script_ddddddddddd && HookEngine::is_executable_memory(g_exe_script_ddddddddddd)) {
+            LOG("Fallback offset thành công: ExeScript tại %p (base + 0x%lx)", 
+                g_exe_script_ddddddddddd, func_offset);
+        } else {
+            LOG("Offset 0x96b8c4 không hợp lệ hoặc không executable");
+            g_exe_script_ddddddddddd = nullptr;
+        }
+    } else {
+        LOG("Không lấy được base address");
+    }
+}
+
+// Đầu file: khai báo global (nếu chưa có)
+std::atomic<LuaInterface*> g_lua_interface{nullptr};
+std::atomic<lua_State*>    g_lua_state{nullptr};
+
+// Hàm gọi Lua event với 11 tham số
+void TriggerLuaEventExtended_Hook(
+    unsigned int script_id,
+    const char *event_name,
+    int p1, int p2, int p3, int p4, int p5,
+    int p6, int p7, int p8, int p9, int p10, int p11
+) {
+    if (!g_exe_script_ddddddddddd) {
+        LOG("Chưa resolve được ExeScript func");
+        return;
+    }
+    if (!g_lua_interface) {
+        LOG("Chưa resolve được LuaInterface");
+        return;
+    }
+
+    // typedef đúng cú pháp Linux x64 (không __fastcall)
+    typedef long long (*ExeScriptFuncPtr)(
+        void* this_ptr,
+        unsigned int id,
+        const char *name,
+        int a1, int a2, int a3, int a4, int a5,
+        int a6, int a7, int a8, int a9, int a10, int a11
+    );
+
+    ExeScriptFuncPtr func = (ExeScriptFuncPtr)g_exe_script_ddddddddddd;
+
+    long long result = func(
+        g_lua_interface,
+        script_id,
+        event_name,
+        p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11
+    );
+
+    LOG("Gọi thành công ExeScript | script=%u | event=%s | result=%lld",
+        script_id, event_name, result);
+}
+
+#define TRIGGER_LUA_EVENT(script_id, event, scene, self, target) \
+    TriggerLuaEventExtended_Hook( \
+        (unsigned int)(script_id), \
+        (event), \
+        (int)(scene), \
+        (int)(self), \
+        (int)(target), \
+        -1, 0, 0, 0, 0, 0, 0, 0 \
+    )
+// Sử dụng
+//TRIGGER_LUA_EVENT(2116, "OnDefaultEvent", scene_id, obj_id, obj_id);
+
+static double safe_get_number(lua_State *L, int idx, double fallback = 0.0) {
+    if (lua_isnumber(L, idx)) {
+        return lua_tonumber(L, idx);
+    }
+    LOG("Arg %d không phải number (type=%d - %s), fallback %.2f",
+        idx, lua_type(L, idx),
+        lua_typename(L, lua_type(L, idx)),  // dùng lua_typename nếu có
+        fallback);
+    return fallback;
+}
+
+static int safe_get_int(lua_State *L, int idx, int fallback = 0) {
+    if (lua_isnumber(L, idx)) {
+        return (int)lua_tonumber(L, idx);
+    }
+    LOG("Arg %d không phải number (type=%d - %s), fallback %d",
+        idx, lua_type(L, idx),
+        lua_typename(L, lua_type(L, idx)),
+        fallback);
+    return fallback;
+}
+
+
+
+// Hàm hook cho LuaFnEquipTransToNew
+extern "C" int LuaFnEquipTransToNew(lua_State *L) {
+    LOG("LuaFnEquipTransToNew called from Lua");
+
+    int n = lua_gettop(L);
+    if (n < 5) {
+        LOG("Thiếu argument (cần >=5)");
+        lua_pushnumber(L, -1.0);
+        return 1;
+    }
+
+    int scene_id   = safe_get_int(L, 1);
+    int obj_id     = safe_get_int(L, 2);
+    int uBagIndex  = safe_get_int(L, 3);
+    int ItemSerial = safe_get_int(L, 4);
+    double v1      = safe_get_number(L, 5, 0.0);
+
+    LOG("Args: scene_id=%d, obj_id=%d, bag=%d, serial=%d, v1=%.2f",
+        scene_id, obj_id, uBagIndex, ItemSerial, v1);
+
+
+    LOG("EquipTransToNew success (placeholder offsets)");
+    lua_pushnumber(L, 1.0);
+    return 1;
+}
+/* ==================== HÀM GET ACCOUNT CỦA CHAR ===================*/
+
+extern "C" int LuaFnGetAccountName(lua_State *L) {
+    LOG("LuaFnGetAccountName called from Lua");
+    
+    int n = lua_gettop(L);
+    LOG("Number of arguments: %d", n);
+    
+    if (n >= 1 && lua_isstring(L, 1)) {
+        const char* param = lua_tostring(L, 1);
+        LOG("Parameter: %s", param);
+    }
+    
+    const char* text = "Test OK LuaFnGetAccountName";
+    
+    // Push kết quả lên Lua stack
+    lua_pushstring(L, text);
+    
+    LOG("Returning LuaFnGetAccountName: %s", text);
+    return 1;
+}
+/* ============================================================
+   HOOK THÊM HÀM VÀO GS
+============================================================ */
+extern "C"
+int FoxRegisterFunction_Hook(void* this_void_ptr, const char* func_name, void* func_ptr) {
+    // Cast an toàn sang LuaInterface* (server truyền đúng loại)
+    LuaInterface* this_ptr = static_cast<LuaInterface*>(this_void_ptr);
+
+    // Log debug (bật nếu cần, comment khi ổn định)
+    // LOG("FoxRegisterFunction_Hook: this_ptr=%p, func_name=%s, func_ptr=%p", this_ptr, func_name ? func_name : "NULL", func_ptr);
+
+    if (!g_orig_FoxRegisterFunction) {
+        LOG("ERROR: g_orig_FoxRegisterFunction is NULL!");
+        return 0;
+    }
+
+    if (!func_name) {
+        LOG("WARNING: func_name is NULL, skipping original call");
+        return 0;
+    }
+
+    // Gọi hàm gốc để đăng ký hàm hiện tại
+    int ret = g_orig_FoxRegisterFunction(this_void_ptr, func_name, func_ptr);
+    //LOG("Original function registered: %s (ret=%d)", func_name, ret);
+
+    // Lưu LuaInterface* ngay lần đầu (điểm mấu chốt để lấy this_ptr)
+    if (g_lua_interface.load() == nullptr) {
+        g_lua_interface.store(this_ptr);
+        LOG("[FoxRegisterFunction_Hook] Lưu LuaInterface* = %p", this_ptr);
+    }
+
+    // Chỉ inject một lần duy nhất sau ScriptGlobal_Format
+    if (!g_lua_injected.load(std::memory_order_acquire) && 
+        strcmp(func_name, "ScriptGlobal_Format") == 0) {
+        
+        pthread_mutex_lock(&g_lua_mutex);
+        if (!g_lua_injected.load(std::memory_order_acquire)) {
+            LOG("=== BATCH INJECTING LUA FUNCTIONS ===");
+            
+            // Định nghĩa mảng các hàm Lua cần inject
+            const struct {
+                const char* name;
+                lua_CFunction func;
+            } luaFunctions[] = {
+                // ===== THÊM CÁC HÀM LUA CỦA BẠN VÀO ĐÂY =====
+                {"LuaFnGetAccountName", LuaFnGetAccountName},
+                {"LuaFnEquipTransToNew", LuaFnEquipTransToNew},
+                // =============================================
+            };
+            
+            const int numFunctions = sizeof(luaFunctions) / sizeof(luaFunctions[0]);
+            int successCount = 0;
+            
+            for (int i = 0; i < numFunctions; i++) {
+                LOG("Injecting [%d/%d] %s...", i + 1, numFunctions, luaFunctions[i].name);
+                
+                int injectRet = g_orig_FoxRegisterFunction(this_ptr,luaFunctions[i].name,(void*)luaFunctions[i].func);
+                
+                if (injectRet == 1) {
+                    successCount++;
+                    LOG("  ✓ %s injected successfully", luaFunctions[i].name);
+                } else {
+                    LOG("  ✗ %s injection failed (ret=%d)", luaFunctions[i].name, injectRet);
+                }
+            }
+            
+            if (successCount == numFunctions) {
+                LOG("=== ALL %d LUA FUNCTIONS INJECTED SUCCESSFULLY ===", numFunctions);
+            } else {
+                LOG("=== INJECTED %d/%d LUA FUNCTIONS (SOME FAILED) ===", successCount, numFunctions);
+            }
+            
+            g_lua_injected.store(true, std::memory_order_release);
+        }
+        pthread_mutex_unlock(&g_lua_mutex);
+    }
+
+    //LOG("<<< FoxRegisterFunction_Hook EXITED, returning %d", ret);
+    return ret;
+}
+
+
+/* ============================================================
+   HÀM HOOK CHÍNH - TỐI ƯU, CHECK NULL, THREAD SAFE
+============================================================ */
+
+
+static void DebugLog(const char* fmt, ...)
+{
+    FILE* f = fopen("/home/tlbb/Server/Log/ScriptGlobal_Format.txt", "a+");
+    if (!f) return;
+
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+
+    fprintf(f, "\n");
+    fclose(f);
+}
+
+/* ============================================================
+   HÀM THÚ CƯỠI
 ============================================================ */
 
 // Thêm hàm debug trong hook_all hoặc đầu skill005_hook
@@ -594,7 +947,6 @@ static void debug_ride_table_to_file() {
 	*/
 extern "C"
 int64_t skill005_hook(void* _this, unsigned int* a2, int a3) {
-    LOG("==== skill005_hook thú cưỡi Impact START ====");
     if (!a2) {
         LOG("a2 NULL");
         return 0;
@@ -674,7 +1026,7 @@ int64_t skill005_hook(void* _this, unsigned int* a2, int a3) {
         }
     }
     LOG("v4=%d", v4);
-	
+
     int ExteriorRideMaxSpeed = get_max_speed((void*)a2);
     LOG("ExteriorRideMaxSpeed=%d", ExteriorRideMaxSpeed);
 
@@ -685,42 +1037,48 @@ int64_t skill005_hook(void* _this, unsigned int* a2, int a3) {
     }
     LOG("table index=%d", index);
 
-    int nImpact = dword_103FE70[index];
+    int v6 = dword_103FE70[index];
+
     switch (ExteriorRideMaxSpeed) {
-        case 20: nImpact = dword_103FE70[index + 1]; break;
-        case 40: nImpact = dword_103FE70[index + 2]; break;
-        case 60: nImpact = dword_103FE70[index + 3]; break;
-        case 70: nImpact = dword_103FE70[index + 4]; break;
-        case 75: nImpact = dword_103FE70[index + 5]; break;
-        case 80: nImpact = dword_103FE70[index + 6]; break;
-        case 85: nImpact = dword_103FE70[index + 7]; break;
-        case 90: nImpact = dword_103FE70[index + 8]; break;
-        case 95: nImpact = dword_103FE70[index + 9]; break;
+        case 20: v6 = dword_103FE70[index + 1]; break;
+        case 40: v6 = dword_103FE70[index + 2]; break;
+        case 60: v6 = dword_103FE70[index + 3]; break;
+        case 70: v6 = dword_103FE70[index + 4]; break;
+        case 75: v6 = dword_103FE70[index + 5]; break;
+        case 80: v6 = dword_103FE70[index + 6]; break;
+        case 85: v6 = dword_103FE70[index + 7]; break;
+        case 90: v6 = dword_103FE70[index + 8]; break;
+        case 95: v6 = dword_103FE70[index + 9]; break;
         default: break;
     }
-	
-    LOG("nImpact (impact id)=%d", nImpact);
+
+    LOG("nImpact (impact id)=%d", v6);
+
+    if (v6 <= 0) {
+        LOG("invalid impact");
+        return 0;
+    }
+
+	int v8 = 0;
 	//fix thu cuoi toc do 85%
     //LOG("81 = %d",  index +81);
     //LOG("82 = %d",  index +82);
     //LOG("83 = %d",  index +83);
 	// vị trí tốc độ của thú cưỡi trong Exterior_Ride.txt, fix impact thú cưỡi + 85%
 	if (dword_103FE70[index + 82] == 85) {
-		nImpact = nImpact + 1;
-		LOG("Fix impact Ride 85% = %d",  nImpact);
+		v8 = send_impact(impact_core, a2, (unsigned short)(v6 + 1), a2[2], 1, 100);
+		LOG("Fix impact Ride 85% = %d",  v6 + 1);
+	} else {
+		v8 = send_impact(impact_core, a2, (unsigned short)v6, a2[2], 1, 100);
 	}
 
-    if (nImpact <= 0) {
-        LOG("invalid impact");
-        return 0;
-    }
 
     // Gửi impact, +1 theo nhu cầu
-    int result = send_impact(impact_core, a2, (unsigned short)nImpact, a2[2], 1, 100);
-    LOG("SendImpact result=%d", result);
+    //int v8 = send_impact(impact_core, a2, (unsigned short)v6, a2[2], 1, 100);
+    LOG("SendImpact result=%d", v8);
 
-    if (!result) {
-        LOG("SendImpact FAILED impact=%d", nImpact);
+    if (!v8) {
+        LOG("SendImpact FAILED impact=%d", v6);
         return 0;
     }
 
@@ -728,441 +1086,274 @@ int64_t skill005_hook(void* _this, unsigned int* a2, int a3) {
     return 1;
 }
 
-//lay ra ham lua co tren sv strings ./libLuaLib.so | grep -i '^lua_' | sort | uniq > lua_symbols.txt
-//g++ -shared -fPIC -O2 -std=c++14 -pthread -I/home/tlbb/Server/Lua hook_so.cpp -ldl -o hook_so.so
-//strings ./Server | grep -i -C 10 "TriggerLuaEventExtended" > TriggerLuaEventExtended.txt
-//strings ./Server | grep -i "LuaFnTbl\|BeginEvent\|AddText\|AddNumber\|CallScriptFunction" > lua_cpp2.txt
+
 /* ============================================================
-   FOXLUA SCRIPT REGISTER FUNCTION - THEO PSEUDOCODE
+   HÀM ScriptGlobal_Format
 ============================================================ */
-// int __cdecl FoxLuaScript::RegisterFunction(FoxLuaScript *const this, char *FuncName, void *Func)
-typedef int (*FoxLuaScript_RegisterFunction_t)(void* this_ptr, const char* func_name, void* func_ptr);
-static FoxLuaScript_RegisterFunction_t g_orig_FoxRegisterFunction = nullptr;
 
-static std::atomic<bool> g_lua_injected{false};
-static pthread_mutex_t g_lua_mutex = PTHREAD_MUTEX_INITIALIZER;
-// Định nghĩa các hàm Lua cần thiết nếu không có header
-typedef struct lua_State lua_State;
-typedef int (*lua_CFunction)(lua_State *L);
+typedef int64_t (*ScriptGlobal_Format_t)(
+    char* dest,
+    int len,
+    const char* fmt,
+    int count,
+    ...
+);
 
-//khai báo
-extern "C" {
-    int LuaFnGetAccountName(lua_State *L);
-    int LuaFnEquipTransToNew(lua_State *L);
-    // ... thêm các hàm khác
-}
-/*
-// Các hàm Lua thường dùng
-extern "C" {
-    // Core stack operations (rất chắc chắn có)
-    int lua_gettop(lua_State *L);
-    void lua_settop(lua_State *L, int idx);
+static ScriptGlobal_Format_t g_orig_ScriptGlobal_Format = nullptr;
+static void* g_trampoline = nullptr;
 
-    // Type checking & conversion (cần thiết cho safe_get_number)
-    int lua_isnumber(lua_State *L, int idx);
-    int lua_isstring(lua_State *L, int idx);
-    int lua_type(lua_State *L, int idx);
-    const char* lua_typename(lua_State *L, int tp);   // để log type name nếu cần debug
+int64_t ScriptGlobal_Format_Hook(
+        char *dest,
+        int a2,
+        const char *a3,
+        int a4,
+        ...)
+{
+    DebugLog("===== ScriptGlobal_Format ENTER =====");
+    DebugLog("dest=%p len=%d fmt=%s count=%d",
+             dest, a2, a3 ? a3 : "(null)", a4);
 
-    double lua_tonumber(lua_State *L, int idx);
-    const char* lua_tostring(lua_State *L, int idx);   // có trong danh sách, dùng nếu cần string
-
-    // Push values (cần để trả về kết quả)
-    void lua_pushnil(lua_State *L);
-    void lua_pushnumber(lua_State *L, double n);
-    void lua_pushstring(lua_State *L, const char* s);
-    void lua_pushvalue(lua_State *L, int idx);
-
-    // Global variable access (nếu cần đọc/ghi global Lua)
-    void lua_getglobal(lua_State *L, const char* name);
-    void lua_setglobal(lua_State *L, const char* name);
-
-    // Optional: nếu bạn cần gọi Lua function từ C (ít dùng trong hook)
-    void lua_call(lua_State *L, int nargs, int nresults);
-    void lua_rawcall(lua_State *L, int nargs, int nresults);
-
-    // Optional: nếu cần tạo table hoặc userdata (ít dùng ở đây)
-    void lua_newtable(lua_State *L);
-    void* lua_newuserdata(lua_State *L, size_t nbytes);
-	
-    int lua_isfunction(lua_State *L, int idx);
-}
-*/
-/* ============================================================
-   HOOK THÊM HÀM VÀO GS
-============================================================ */
-int FoxRegisterFunction_Hook(void* this_void_ptr, const char* func_name, void* func_ptr) {
-    // Cast an toàn sang LuaInterface* (server truyền đúng loại)
-    LuaInterface* this_ptr = static_cast<LuaInterface*>(this_void_ptr);
-
-    // Log debug (bật nếu cần, comment khi ổn định)
-    // LOG("FoxRegisterFunction_Hook: this_ptr=%p, func_name=%s, func_ptr=%p", this_ptr, func_name ? func_name : "NULL", func_ptr);
-
-    if (!g_orig_FoxRegisterFunction) {
-        LOG("ERROR: g_orig_FoxRegisterFunction is NULL!");
+    if (!dest || a2 <= 0)
+    {
+        DebugLog("Invalid dest buffer");
         return 0;
     }
 
-    if (!func_name) {
-        LOG("WARNING: func_name is NULL, skipping original call");
+    va_list va;
+    va_start(va, a4);
+
+    memset(dest, 0, a2);
+
+    if (!a3)
+    {
+        DebugLog("fmt NULL");
+        va_end(va);
         return 0;
     }
 
-    // Gọi hàm gốc để đăng ký hàm hiện tại
-    int ret = g_orig_FoxRegisterFunction(this_void_ptr, func_name, func_ptr);
-    //LOG("Original function registered: %s (ret=%d)", func_name, ret);
+    size_t v15 = strlen(a3) + 1;
+    int v16 = (int)v15 - 1;
+    int64_t result = 0;
 
-    // Lưu LuaInterface* ngay lần đầu (điểm mấu chốt để lấy this_ptr)
-    if (g_lua_interface.load() == nullptr) {
-        g_lua_interface.store(this_ptr);
-        LOG("[FoxRegisterFunction_Hook] Lưu LuaInterface* = %p", this_ptr);
-    }
+    if (a2 > (int)v15 - 1)
+    {
+        memcpy(dest, a3, (int)v15 - 2);
 
-    // Chỉ inject một lần duy nhất sau ScriptGlobal_Format
-    if (!g_lua_injected.load(std::memory_order_acquire) && 
-        strcmp(func_name, "ScriptGlobal_Format") == 0) {
-        
-        pthread_mutex_lock(&g_lua_mutex);
-        if (!g_lua_injected.load(std::memory_order_acquire)) {
-            LOG("=== BATCH INJECTING LUA FUNCTIONS ===");
-            
-            // Định nghĩa mảng các hàm Lua cần inject
-            const struct {
-                const char* name;
-                lua_CFunction func;
-            } luaFunctions[] = {
-                // ===== THÊM CÁC HÀM LUA CỦA BẠN VÀO ĐÂY =====
-                {"LuaFnGetAccountName", LuaFnGetAccountName},
-                {"LuaFnEquipTransToNew", LuaFnEquipTransToNew},
-                {"LuaFnMoveItemBagPos", LuaFnMoveItemBagPos},
-                // =============================================
-            };
-            
-            const int numFunctions = sizeof(luaFunctions) / sizeof(luaFunctions[0]);
-            int successCount = 0;
-            
-            for (int i = 0; i < numFunctions; i++) {
-                LOG("Injecting [%d/%d] %s...", i + 1, numFunctions, luaFunctions[i].name);
-                
-                int injectRet = g_orig_FoxRegisterFunction(this_ptr,luaFunctions[i].name,(void*)luaFunctions[i].func);
-                
-                if (injectRet == 1) {
-                    successCount++;
-                    LOG("  ✓ %s injected successfully", luaFunctions[i].name);
-                } else {
-                    LOG("  ✗ %s injection failed (ret=%d)", luaFunctions[i].name, injectRet);
-                }
+        if (a4 <= 0)
+        {
+            dest[v16 - 1] = 125; // '}'
+            va_end(va);
+            return 1;
+        }
+
+        dest[v16 - 1] = 42; // '*'
+        int v18 = v16 + 2;
+
+        if (a2 <= v16 + 2)
+        {
+            DebugLog("Buffer too small after header");
+            va_end(va);
+            return 0;
+        }
+
+        int v19 = 0;
+        int v20 = 0;
+
+        while (1)
+        {
+            const char* v23 = va_arg(va, const char*);// fix cho nay
+			
+			
+            DebugLog("arg[%d]=%p", v19, v23);
+
+            if (!v23)
+            {
+                DebugLog("arg NULL");
+                va_end(va);
+                return 0;
             }
-            
-            if (successCount == numFunctions) {
-                LOG("=== ALL %d LUA FUNCTIONS INJECTED SUCCESSFULLY ===", numFunctions);
-            } else {
-                LOG("=== INJECTED %d/%d LUA FUNCTIONS (SOME FAILED) ===", successCount, numFunctions);
+
+            size_t v24 = strlen(v23) + 1;
+            uint8_t v25 = (uint8_t)(v24 - 1);
+
+            if (v18 + 2 + v25 >= a2)
+            {
+                DebugLog("Prevented overflow");
+                va_end(va);
+                return 0;
             }
-            
-            g_lua_injected.store(true, std::memory_order_release);
+
+            dest[v18] = 42;              // '*'
+            dest[v18 + 1] = v25;
+
+            char* v27 = &dest[v18 + 2];
+            unsigned int v28 = v25;
+
+            if (v28 >= 8)
+            {
+                memcpy(v27, v23, v28);
+            }
+            else if (v28 & 4)
+            {
+                *(uint32_t*)v27 = *(uint32_t*)v23;
+                *(uint32_t*)&v27[v28 - 4] = *(uint32_t*)&v23[v28 - 4];
+            }
+            else if (v28)
+            {
+                *v27 = *v23;
+                if (v28 & 2)
+                    *(uint16_t*)&v27[v28 - 2] = *(uint16_t*)&v23[v28 - 2];
+            }
+
+            v18 += 2 + v25;
+            v20 += v25 + 2;
+
+            if (a4 == ++v19)
+                break;
         }
-        pthread_mutex_unlock(&g_lua_mutex);
-    }
 
-    //LOG("<<< FoxRegisterFunction_Hook EXITED, returning %d", ret);
-    return ret;
-}
+        if (v20 == 56)
+        {
+            if (v18 >= a2)
+            {
+                va_end(va);
+                return 0;
+            }
 
-/* ============================================================
-   HÀM CALL SCRIPT
-============================================================ */
-
-extern "C" {
-    // ... các extern khác
-
-    // Bỏ __fastcall và __int64, dùng long long
-    long long _ZN12LuaInterface21ExeScript_DDDDDDDDDDDEiPKciiiiiiiiiii(
-        void* this_ptr,
-        unsigned int script_id,
-        const char *event_name,
-        int p1, int p2, int p3, int p4, int p5,
-        int p6, int p7, int p8, int p9, int p10, int p11
-    );
-}
-
-
-// Biến toàn cục
-static void* g_exe_script_ddddddddddd = nullptr;
-
-// Resolve hàm (dlsym ưu tiên + offset fallback)
-void resolve_exe_script_func() {
-    // Cách 1: dlsym (thử tên mangled chính xác)
-    void* handle = dlopen(NULL, RTLD_LAZY | RTLD_GLOBAL);
-    if (handle) {
-        g_exe_script_ddddddddddd = dlsym(handle, "_ZN12LuaInterface21ExeScript_DDDDDDDDDDDEiPKciiiiiiiiiii");
-        if (g_exe_script_ddddddddddd) {
-            LOG("Tìm thấy ExeScript_DDDDDDDDDDD qua dlsym: %p", g_exe_script_ddddddddddd);
-            dlclose(handle);
-            return;
+            dest[v18++] = 32; // padding
+            v20++;
         }
-        dlclose(handle);
-    }
 
-    // Cách 2: fallback offset cứng
-    uintptr_t base = get_module_base("Server");
-    if (base) {
-        uintptr_t func_offset = 0x96b8c4;
-        //g_exe_script_ddddddddddd = (void*)(base + func_offset);
-        g_exe_script_ddddddddddd = (void*)func_offset;
-        if (g_exe_script_ddddddddddd && HookEngine::is_executable_memory(g_exe_script_ddddddddddd)) {
-            LOG("Fallback offset thành công: ExeScript tại %p (base + 0x%lx)", 
-                g_exe_script_ddddddddddd, func_offset);
-        } else {
-            LOG("Offset 0x96b8c4 không hợp lệ hoặc không executable");
-            g_exe_script_ddddddddddd = nullptr;
+        if (v18 < a2)
+        {
+            dest[v18] = 125; // '}'
+
+            if (v18 + 1 < a2)
+            {
+                dest[v18 + 1] = 0;
+                dest[v16] = v19;
+                dest[v16 + 1] = v20 + 3;
+
+                DebugLog("final arg_count=%d payload=%d", v19, v20 + 3);
+                DebugLog("FINAL STRING: %s", dest);
+
+                va_end(va);
+                return 1;
+            }
         }
-    } else {
-        LOG("Không lấy được base address");
     }
+
+    DebugLog("Buffer too small for format");
+    va_end(va);
+    return result;
 }
 
-// Hàm gọi Lua event với 11 tham số
-void TriggerLuaEventExtended_Hook(
-    unsigned int script_id,
-    const char *event_name,
-    int p1, int p2, int p3, int p4, int p5,
-    int p6, int p7, int p8, int p9, int p10, int p11
-) {
-    if (!g_exe_script_ddddddddddd) {
-        LOG("Chưa resolve được ExeScript func");
-        return;
-    }
-    if (!g_lua_interface) {
-        LOG("Chưa resolve được LuaInterface");
-        return;
-    }
+// ==========================================================
+// TYPEDEF
+// ==========================================================
+using LuaFnScriptGlobal_Format_t = int64_t (*)(lua_State*);
 
-    // typedef đúng cú pháp Linux x64 (không __fastcall)
-    typedef long long (*ExeScriptFuncPtr)(
-        void* this_ptr,
-        unsigned int id,
-        const char *name,
-        int a1, int a2, int a3, int a4, int a5,
-        int a6, int a7, int a8, int a9, int a10, int a11
-    );
+static LuaFnScriptGlobal_Format_t g_orig_LuaFnScriptGlobal_Format = nullptr;
+static ScriptGlobal_Format_t      g_ScriptGlobal_Format = nullptr;
 
-    ExeScriptFuncPtr func = (ExeScriptFuncPtr)g_exe_script_ddddddddddd;
+// ==========================================================
+// HOOK FUNCTION
+// ==========================================================
+extern "C"
+int64_t LuaFnScriptGlobal_Format_Hook(lua_State* L)
+{
+    if (!L)
+        return 0;
 
-    long long result = func(
-        g_lua_interface,
-        script_id,
-        event_name,
-        p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11
-    );
-
-    LOG("Gọi thành công ExeScript | script=%u | event=%s | result=%lld",
-        script_id, event_name, result);
-}
-
-#define TRIGGER_LUA_EVENT(script_id, event, scene, self, target) \
-    TriggerLuaEventExtended_Hook( \
-        (unsigned int)(script_id), \
-        (event), \
-        (int)(scene), \
-        (int)(self), \
-        (int)(target), \
-        -1, 0, 0, 0, 0, 0, 0, 0 \
-    )
-// Sử dụng
-//TRIGGER_LUA_EVENT(2116, "OnDefaultEvent", scene_id, obj_id, obj_id);
-
-static double safe_get_number(lua_State *L, int idx, double fallback = 0.0) {
-    if (lua_isnumber(L, idx)) {
-        return lua_tonumber(L, idx);
-    }
-    LOG("Arg %d không phải number (type=%d - %s), fallback %.2f",
-        idx, lua_type(L, idx),
-        lua_typename(L, lua_type(L, idx)),  // dùng lua_typename nếu có
-        fallback);
-    return fallback;
-}
-
-static int safe_get_int(lua_State *L, int idx, int fallback = 0) {
-    if (lua_isnumber(L, idx)) {
-        return (int)lua_tonumber(L, idx);
-    }
-    LOG("Arg %d không phải number (type=%d - %s), fallback %d",
-        idx, lua_type(L, idx),
-        lua_typename(L, lua_type(L, idx)),
-        fallback);
-    return fallback;
-}
-// Hàm hook cho LuaFnEquipTransToNew
-extern "C" int LuaFnEquipTransToNew(lua_State *L) {
-    LOG("LuaFnEquipTransToNew called from Lua");
-
-    int n = lua_gettop(L);
-    if (n < 5) {
-        LOG("Thiếu argument (cần >=5)");
-        lua_pushnumber(L, -1.0);
+    int top = lua_gettop(L);
+    if (top < 1)
+    {
+        lua_pushstring(L, "");
         return 1;
     }
 
-    int scene_id   = safe_get_int(L, 1);
-    int obj_id     = safe_get_int(L, 2);
-    int uBagIndex  = safe_get_int(L, 3);
-    int ItemSerial = safe_get_int(L, 4);
-    double v1      = safe_get_number(L, 5, 0.0);
+    const char* key = lua_tostring(L, 1);
+    if (!key)
+        key = "";
 
-    LOG("Args: scene_id=%d, obj_id=%d, bag=%d, serial=%d, v1=%.2f",
-        scene_id, obj_id, uBagIndex, ItemSerial, v1);
+    int paramCount = top - 1;
 
-    // Lấy Scene (void*)
-    auto GetScene = (GetScene_Type)g_globals.g_GetScene_Func.load();
-    void* pScene = GetScene ? GetScene(scene_id) : nullptr;
-    if (!pScene) {
-        LOG("Scene not found for ID %d", scene_id);
-        lua_pushnumber(L, -1.0);
+    // Nếu không có param -> return key
+    if (paramCount <= 0)
+    {
+        lua_pushstring(L, key);
         return 1;
     }
-		
-    LOG("EquipTransToNew success (placeholder offsets)");
-    lua_pushnumber(L, 1.0);
+
+    if (paramCount > 9)
+        paramCount = 9; // giới hạn như bản gốc
+
+    char dest[320];
+    memset(dest, 0, sizeof(dest));
+
+    // Thu thập param string an toàn
+    const char* args[9] = {0};
+
+    for (int i = 0; i < paramCount; ++i)
+    {
+        if (lua_type(L, i + 2) == LUA_TNIL)
+        {
+            args[i] = "";
+        }
+        else
+        {
+            const char* s = lua_tostring(L, i + 2);
+            args[i] = s ? s : "";
+        }
+    }
+
+    // Gọi ScriptGlobal_Format an toàn theo số param
+    int ok = 0;
+
+    switch (paramCount)
+    {
+        case 1:
+            ok = g_ScriptGlobal_Format(dest, 320, key, 1, args[0]);
+            break;
+        case 2:
+            ok = g_ScriptGlobal_Format(dest, 320, key, 2, args[0], args[1]);
+            break;
+        case 3:
+            ok = g_ScriptGlobal_Format(dest, 320, key, 3, args[0], args[1], args[2]);
+            break;
+        case 4:
+            ok = g_ScriptGlobal_Format(dest, 320, key, 4, args[0], args[1], args[2], args[3]);
+            break;
+        case 5:
+            ok = g_ScriptGlobal_Format(dest, 320, key, 5, args[0], args[1], args[2], args[3], args[4]);
+            break;
+        case 6:
+            ok = g_ScriptGlobal_Format(dest, 320, key, 6, args[0], args[1], args[2], args[3], args[4], args[5]);
+            break;
+        case 7:
+            ok = g_ScriptGlobal_Format(dest, 320, key, 7, args[0], args[1], args[2], args[3], args[4], args[5], args[6]);
+            break;
+        case 8:
+            ok = g_ScriptGlobal_Format(dest, 320, key, 8, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]);
+            break;
+        case 9:
+            ok = g_ScriptGlobal_Format(dest, 320, key, 9, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8]);
+            break;
+        default:
+            ok = 0;
+            break;
+    }
+
+    if (!ok)
+    {
+        snprintf(dest, sizeof(dest),
+                 "FORMAT_ERROR: Key=%s ParamNum=%d",
+                 key, paramCount);
+    }
+
+    lua_pushstring(L, dest);
     return 1;
 }
-/* ==================== HÀM GET ACCOUNT CỦA CHAR ===================*/
-
-extern "C" int LuaFnGetAccountName(lua_State *L) {
-    LOG("LuaFnGetAccountName called from Lua");
-    
-    int n = lua_gettop(L);
-    LOG("Number of arguments: %d", n);
-    
-    if (n >= 1 && lua_isstring(L, 1)) {
-        const char* param = lua_tostring(L, 1);
-        LOG("Parameter: %s", param);
-    }
-    
-    const char* text = "Test OK LuaFnGetAccountName";
-    
-    // Push kết quả lên Lua stack
-    lua_pushstring(L, text);
-    
-    LOG("Returning LuaFnGetAccountName: %s", text);
-    return 1;
-}
-// Typedef các hàm từ source (dlsym)
-typedef Item* (*GetBagItemFn)(Obj_Human*, uint32_t);                     // HumanItemLogic::GetBagItem
-typedef bool (*MoveBagItemFn)(Obj_Human*, uint32_t, uint32_t);           // HumanItemLogic::MoveBagItem
-typedef bool (*SwapBagItemFn)(Obj_Human*, uint32_t, uint32_t);           // HumanItemLogic::SwapBagItem
-typedef void (*SendItemUpdateFn)(Obj_Human*, uint32_t);                  // Obj_Human::SendItemUpdate (update 1 pos)
-
-// Global con trỏ (resolve một lần)
-static GetBagItemFn orig_GetBagItem = nullptr;
-static MoveBagItemFn orig_MoveBagItem = nullptr;
-static SwapBagItemFn orig_SwapBagItem = nullptr;
-static SendItemUpdateFn orig_SendItemUpdate = nullptr;
-
-// Resolve một lần (gọi trong constructor hoặc đầu hook)
-static void ResolveBagItemFunctions() {
-    if (orig_GetBagItem) return;  // Đã resolve rồi
-
-    orig_GetBagItem     = (GetBagItemFn)dlsym(RTLD_NEXT, "_ZN14HumanItemLogic10GetBagItemEP9Obj_Humanj");
-    orig_MoveBagItem    = (MoveBagItemFn)dlsym(RTLD_NEXT, "_ZN12ItemOperator8MoveItemEP13ItemContainerii");
-    orig_SwapBagItem    = (SwapBagItemFn)dlsym(RTLD_NEXT, "");
-    orig_SendItemUpdate = (SendItemUpdateFn)dlsym(RTLD_NEXT, "");  // tên phổ biến, nếu không có thì thử "_ZN9Obj_Human15SendEquipUpdateEv" hoặc reverse
-
-    if (!orig_GetBagItem)     LOG("WARNING: Không dlsym HumanItemLogic::GetBagItem");
-    if (!orig_MoveBagItem)    LOG("WARNING: Không dlsym HumanItemLogic::MoveBagItem");
-    if (!orig_SwapBagItem)    LOG("WARNING: Không dlsym HumanItemLogic::SwapBagItem");
-    if (!orig_SendItemUpdate) LOG("WARNING: Không dlsym Obj_Human::SendItemUpdate - client có thể không update UI");
-}
-// Hàm Lua mới: Di chuyển item từ pos A sang pos B trong bag (giữ nguyên thuộc tính)
-int LuaFnMoveItemBagPos(lua_State* L) {
-    if (lua_gettop(L) < 4) {
-        LOG("[LuaFnMoveItemBagPos] Thiếu tham số (cần 4: scene_id, human_obj_id, from_pos, to_pos)");
-        lua_pushnumber(L, -1.0);
-        return 1;
-    }
-
-    int scene_id     = (int)lua_tonumber(L, 1);
-    int human_obj_id = (int)lua_tonumber(L, 2);
-    int from_pos     = (int)lua_tonumber(L, 3);
-    int to_pos       = (int)lua_tonumber(L, 4);
-
-    LOG("[LuaFnMoveItemBagPos] Called: scene=%d, human=%d, from=%d, to=%d", scene_id, human_obj_id, from_pos, to_pos);
-
-    // Resolve dlsym
-    ResolveBagItemFunctions();
-
-    // Lấy Scene (từ scene_id - cần dlsym hoặc global)
-    // Ví dụ dlsym cho SceneManager::GetScene(int id)
-    typedef Scene* (*GetSceneFn)(int);
-    static GetSceneFn orig_GetScene = (GetSceneFn)dlsym(RTLD_NEXT, "_ZN12SceneManager12GetSceneInfoEs");  // tên mangled phổ biến
-    Scene* pScene = orig_GetScene ? orig_GetScene(scene_id) : nullptr;
-
-    if (!pScene) {
-        LOG("[LuaFnMoveItemBagPos] Không lấy được Scene cho id %d", scene_id);
-        lua_pushnumber(L, -1.0);
-        return 1;
-    }
-
-    // Lấy Obj_Human từ Scene (m_pObjManager->m_pObj là mảng Obj*)
-    Obj_Human* pHuman = (Obj_Human*)pScene->m_pObjManager->m_pObj[human_obj_id];
-    if (!pHuman || !pHuman->IsHuman()) {
-        LOG("[LuaFnMoveItemBagPos] Obj_Human không hợp lệ hoặc không tồn tại: %d", human_obj_id);
-        lua_pushnumber(L, -1.0);
-        return 1;
-    }
-
-    const int HUMAN_BAG_SIZE = 200;  // Điều chỉnh theo version (thường 60 hoặc 100)
-
-    if (from_pos < 0 || from_pos >= HUMAN_BAG_SIZE ||
-        to_pos < 0 || to_pos >= HUMAN_BAG_SIZE ||
-        from_pos == to_pos) {
-        LOG("[LuaFnMoveItemBagPos] Vị trí không hợp lệ: from=%d, to=%d", from_pos, to_pos);
-        lua_pushnumber(L, -1.0);
-        return 1;
-    }
-
-    // Lấy item nguồn
-    Item* pFromItem = orig_GetBagItem ? orig_GetBagItem(pHuman, from_pos) : nullptr;
-    if (!pFromItem || !pFromItem->IsValid()) {
-        LOG("[LuaFnMoveItemBagPos] Không có item tại vị trí nguồn: %d", from_pos);
-        lua_pushnumber(L, -1.0);
-        return 1;
-    }
-
-    // Lấy item đích
-    Item* pToItem = orig_GetBagItem ? orig_GetBagItem(pHuman, to_pos) : nullptr;
-
-    bool success = false;
-
-    if (!pToItem || !pToItem->IsValid()) {
-        // Move item nếu đích trống
-        if (orig_MoveBagItem) {
-            success = orig_MoveBagItem(pHuman, from_pos, to_pos);
-        } else {
-            LOG("[LuaFnMoveItemBagPos] Không có MoveBagItem - không thể move");
-        }
-    } else {
-        // Swap nếu đích có item
-        if (orig_SwapBagItem) {
-            success = orig_SwapBagItem(pHuman, from_pos, to_pos);
-        } else {
-            LOG("[LuaFnMoveItemBagPos] Không có SwapBagItem - không thể swap");
-        }
-    }
-
-    // Notify client update bag (update 2 vị trí)
-    if (success && orig_SendItemUpdate) {
-        orig_SendItemUpdate(pHuman, from_pos);
-        orig_SendItemUpdate(pHuman, to_pos);
-    } else if (success) {
-        LOG("[LuaFnMoveItemBagPos] Move/Swap thành công nhưng không notify client (không có SendItemUpdate)");
-    }
-
-    lua_pushnumber(L, success ? 1.0 : -1.0);
-    return 1;
-}
-
-
 /* ============================================================
    INITIALIZATION - THREAD SAFE, CHỈ 1 LẦN
 ============================================================ */
@@ -1192,6 +1383,7 @@ private:
 	  HOOK_ALL
 	============================================================ */
 	void hook_all() {
+		//------------------------------------------FoxLuaScript::RegisterFunction----------------------------------------------//
 		// Hook FoxLuaScript::RegisterFunction ngay lập tức
 		LOG("Attempting to hook FoxLuaScript::RegisterFunction...");
 		void* fox_addr = dlsym(RTLD_DEFAULT, "_ZN12FoxLuaScript16RegisterFunctionEPKcPv");
@@ -1199,12 +1391,11 @@ private:
 
 		if (fox_addr) {
 			LOG("Creating trampoline...");
-			void* trampoline = HookEngine::create_trampoline(fox_addr);
+			void* trampoline = HookEngine::create_trampoline(fox_addr, 32);
 			if (trampoline) {
 				g_orig_FoxRegisterFunction = (FoxLuaScript_RegisterFunction_t)trampoline;
 				LOG("Patching...");
 				HookEngine::patch_code_safe(fox_addr, (void*)FoxRegisterFunction_Hook);
-				
 				LOG("FoxLuaScript::RegisterFunction hooked with trampoline");
 			} else {
 				LOG("ERROR: Cannot create trampoline");
@@ -1212,11 +1403,70 @@ private:
 		} else {
 			LOG("ERROR: Cannot find FoxLuaScript::RegisterFunction");
 		}
+		//----------------------------------------ScriptGlobal_Format------------------------------------------------//
+		
+		// Tạo thread riêng để hook skill sau x giây (không block thread chính)
+		std::thread([this]() {
+			//sleep(45); // Hoặc 
+			std::this_thread::sleep_for(std::chrono::seconds(45));
+			// Hook FoxLuaScript::RegisterFunction ngay lập tức
+			LOG("Attempting to hook ScriptGlobal_Format...");
 
+			uintptr_t target = 0x6B0F70;   // offset bạn cung cấp __int64 ScriptGlobal_Format(
+			LOG("ScriptGlobal_Format runtime addr: %p", (void*)target);
+			g_trampoline = HookEngine::create_trampoline((void*)target, 64);
+			if (!g_trampoline)
+			{
+				LOG("create_trampoline failed");
+				return;
+			}
+
+			g_orig_ScriptGlobal_Format = (ScriptGlobal_Format_t)g_trampoline;
+
+			HookEngine::patch_code_safe(
+				(void*)target,
+				(void*)ScriptGlobal_Format_Hook
+			);
+
+			LOG("ScriptGlobal_Format hooked successfully");
+
+		}).detach(); // detach để thread tự quản lý
+		
+		//------------------------------------------LuaFnScriptGlobal_Format_Hook----------------------------------------------//
+		std::thread([this]() {
+
+			//std::this_thread::sleep_for(std::chrono::seconds(45));
+
+			LOG("Attempting to hook LuaFnScriptGlobal_Format...");
+
+			uintptr_t offset = 0x8CF6E0;  // offset bạn cung cấp
+
+			LOG("LuaFnScriptGlobal_Format runtime addr: %p", (void*)offset);
+/*
+			g_trampoline = HookEngine::create_trampoline((void*)offset, 64);
+			if (!g_trampoline)
+			{
+				LOG("create_trampoline failed");
+				return;
+			}
+
+			// ⚠ Kiểu phải đúng prototype
+			g_orig_LuaFnScriptGlobal_Format =
+				(LuaFnScriptGlobal_Format_t)g_trampoline;
+*/
+			HookEngine::patch_code_safe(
+				(void*)offset,
+				(void*)LuaFnScriptGlobal_Format_Hook
+			);
+
+			LOG("LuaFnScriptGlobal_Format hooked successfully");
+
+		}).detach();
+		//------------------------------------------fix thu cuoi----------------------------------------------//
 		// Tạo thread riêng để hook skill sau 45 giây (không block thread chính)
 		std::thread([this]() {
 			//sleep(30); // Hoặc 
-			std::this_thread::sleep_for(std::chrono::seconds(30));
+			std::this_thread::sleep_for(std::chrono::seconds(45));
 			
 			void* skill_addr = dlsym(RTLD_DEFAULT, 
 				"_ZNK13Combat_Module12Skill_Module16CommonSkill005_T16EffectOnUnitOnceER13Obj_CharacterS3_i");
@@ -1227,6 +1477,9 @@ private:
 				LOG("ERROR: Cannot find Skill005 address");
 			}
 		}).detach(); // detach để thread tự quản lý
+		//----------------------------------------------------------------------------------------//
+
+
 	}	
 	
 public:
@@ -1251,7 +1504,7 @@ pthread_once_t ServerHook::once_control = PTHREAD_ONCE_INIT;
 ============================================================ */
 __attribute__((constructor))
 void init() {
-	resolve_exe_script_func(); //ExeScript_DDDDDDDDDDD
+	//resolve_exe_script_func(); //ExeScript_DDDDDDDDDDD gọi ở hàm cần dùng .lua
     // Chỉ khởi tạo instance, đảm bảo thread-safe
     ServerHook::getInstance();
 }
