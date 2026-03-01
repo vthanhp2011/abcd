@@ -18,6 +18,18 @@
 #include <memory>
 #include <cstdint>
 #include <thread>
+#include <atomic>          // cho std::atomic
+// Thay bằng (include 3 header chuẩn Lua 5.1)
+// Đã có từ trước (giữ nguyên nếu có)
+#include "lua.h"
+#include "lauxlib.h"
+#include "lualib.h"
+
+
+// Forward declare (đã có hoặc thêm nếu thiếu)
+class LuaInterface;
+class Scene;
+
 
 #define HOOK_STUB_SIZE 14
 #define TRAMPOLINE_COPY_SIZE 32
@@ -174,10 +186,9 @@ struct GlobalPointers {
 	std::atomic<void*> g_NotifyEquipAttr_Func{nullptr};
 	std::atomic<void*> g_RandomAttrRate_Func{nullptr};  // nếu có hàm random riêng
 	//
-	// Thêm vào struct GlobalPointers (hoặc global riêng)
-	std::atomic<void*> g_lua_interface{nullptr};  // LuaInterface*
-	std::atomic<lua_State*> g_lua_state{nullptr}; // lua_State* để dùng trực tiếp
-	
+	// Sửa hoặc thêm mới (thay thế nếu bạn đã khai báo sai kiểu void*)
+	std::atomic<LuaInterface*> g_lua_interface{nullptr};
+	std::atomic<lua_State*>    g_lua_state{nullptr};	
 };
 
 static GlobalPointers g_globals;
@@ -724,10 +735,12 @@ static pthread_mutex_t g_lua_mutex = PTHREAD_MUTEX_INITIALIZER;
 // Định nghĩa các hàm Lua cần thiết nếu không có header
 typedef struct lua_State lua_State;
 typedef int (*lua_CFunction)(lua_State *L);
-static void* g_lua_interface = nullptr;          // LuaInterface*
-// Typedef cho Init
+
+// Typedef cho member function pointer (giữ nguyên hoặc thêm)
 typedef void (LuaInterface::*InitFn)(Scene*);
 static InitFn orig_Init = nullptr;
+
+static bool g_init_hooked = false;
 
 
 //khai báo
@@ -736,6 +749,7 @@ extern "C" {
     int LuaFnEquipTransToNew(lua_State *L);
     // ... thêm các hàm khác
 }
+/*
 // Các hàm Lua thường dùng
 extern "C" {
     // Core stack operations (rất chắc chắn có)
@@ -770,7 +784,7 @@ extern "C" {
     void* lua_newuserdata(lua_State *L, size_t nbytes);
 	
     int lua_isfunction(lua_State *L, int idx);
-}
+}*/
 
 /* ============================================================
    HÀM CALL SCRIPT
@@ -788,69 +802,66 @@ extern "C" {
         int p6, int p7, int p8, int p9, int p10, int p11
     );
 }
-// Biến flag để biết đã hook Init chưa
-static bool g_init_hooked = false;
 
 void resolve_lua_interface() {
     if (g_lua_interface.load() != nullptr) {
-        return;  // Đã có rồi
+        return;  // Đã resolve rồi
     }
 
-    orig_Init = (InitFn)dlsym(RTLD_NEXT, "_ZN12LuaInterface4InitEP5Scene");
-    if (orig_Init == nullptr) {
-        LOG("resolve_lua_interface: Không tìm thấy symbol LuaInterface::Init !");
+	
+    void* sym = dlsym(RTLD_NEXT, "_ZN12LuaInterface4InitEP5Scene");
+    if (sym == nullptr) {
+        LOG("Không tìm thấy symbol LuaInterface::Init");
         return;
     }
 
-    LOG("resolve_lua_interface: Tìm thấy LuaInterface::Init tại %p", (void*)orig_Init);
+    // Cast đúng kiểu member function pointer
+    // Lưu ý: cast này hợp lệ ở hầu hết compiler, nhưng không phải lúc nào cũng an toàn 100%
+    orig_Init = reinterpret_cast<InitFn>(sym);
 
-    // Thực hiện hook Init (bạn cần có hàm hook member function)
-    // Nếu bạn đã có MinHook hoặc subhook, dùng như sau:
-    // MH_CreateHook((LPVOID)orig_Init, hooked_Init, (LPVOID*)&orig_Init_real);
-    // MH_EnableHook((LPVOID)orig_Init);
+    LOG("Tìm thấy LuaInterface::Init tại %p", sym);
 
-    // Nếu chưa có lib hook, dùng cách tạm thời: gọi resolve ở constructor và giả định Init được gọi nhiều lần
-    // Hoặc implement patch byte đơn giản (dùng patch_code_safe nếu bạn có)
-
-    // Giả sử bạn có hàm hook_function(void* target, void* detour) → thay bằng:
-    // hook_function((void*)orig_Init, (void*)hooked_Init);  // Nếu là free func, nhưng đây là member → cần adjust
+    // Ở đây chưa hook thật (chỉ dlsym). Hook thật cần MinHook hoặc patch byte.
+    // Nếu bạn chưa có hook, tạm thời dùng để test khi Init được gọi ở chỗ khác.
+    // Sau này thêm hook nếu cần intercept call Init.
 
     g_init_hooked = true;
-    LOG("LuaInterface::Init đã được hook thành công (chờ gọi để lấy this)");
 }
-// Detour cho LuaInterface::Init(Scene*)
+
+
 void hooked_Init(LuaInterface* this_ptr, Scene* scene) {
-    // Gọi hàm gốc trước (để server chạy bình thường)
+    // Gọi hàm gốc (syntax gọi member function pointer)
     if (orig_Init) {
         (this_ptr->*orig_Init)(scene);
     }
 
-    // Lưu LuaInterface* this một lần (thường mỗi Scene có một, nhưng ta lấy cái đầu tiên hoặc last)
+    // Lưu this_ptr nếu chưa có
     if (g_lua_interface.load() == nullptr) {
         g_lua_interface.store(this_ptr);
         LOG("[hooked_Init] Lưu LuaInterface* = %p (Scene = %p)", this_ptr, scene);
     }
 
-    // Thử lấy lua_State* từ các offset phổ biến trong TLBB leak
+    // Thử tìm lua_State* bằng offset
     static const uintptr_t offsets[] = {0x4, 0x8, 0x10, 0x18, 0x20, 0x58, 0x60, 0x68};
-    lua_State* candidate = nullptr;
+    lua_State* L_candidate = nullptr;
 
-    for (size_t i = 0; i < sizeof(offsets)/sizeof(offsets[0]); ++i) {
-        uintptr_t off = offsets[i];
-        lua_State** pp = (lua_State**)((uintptr_t)this_ptr + off);
-        if (pp && *pp && lua_gettop(*pp) >= 0 && lua_isstring(*pp, -1) == 0) {  // check state hợp lệ
-            candidate = *pp;
-            LOG("[hooked_Init] Phát hiện lua_State* = %p tại offset 0x%lx", candidate, off);
+    for (auto off : offsets) {
+        lua_State** ppL = (lua_State**)((uintptr_t)this_ptr + off);
+        lua_State* possible_L = *ppL;
+        if (possible_L && lua_gettop(possible_L) >= 0) {  // check state có vẻ hợp lệ
+            L_candidate = possible_L;
+            LOG("[hooked_Init] Phát hiện lua_State* = %p tại offset 0x%lx", L_candidate, off);
             break;
         }
     }
 
-    if (candidate) {
-        g_lua_state.store(candidate);
+    if (L_candidate) {
+        g_lua_state.store(L_candidate);
     } else {
-        LOG("[hooked_Init] Không tìm thấy lua_State* - cần reverse offset chính xác bằng IDA/Ghidra");
+        LOG("[hooked_Init] Không tìm thấy lua_State* - thử reverse offset bằng IDA");
     }
 }
+
 
 // Biến toàn cục
 static void* g_exe_script_ddddddddddd = nullptr;
@@ -898,20 +909,25 @@ void TriggerLuaEventExtended_Hook(
 	// Trong TriggerLuaEventExtended_Hook (hoặc hàm tương ứng)
 	LuaInterface* lua_interface = g_lua_interface.load();
 	if (lua_interface == nullptr) {
-		LOG("TriggerLuaEventExtended_Hook: g_lua_interface vẫn NULL! (Init chưa được gọi hoặc hook fail)");
-		// Có thể fallback gọi orig_...
-		return orig_TriggerLuaEventExtended(params...);
+		LOG("TriggerLuaEventExtended_Hook: LuaInterface NULL - có thể Init chưa được gọi hoặc hook chưa hoạt động");
+		// Gọi hàm gốc nếu có
+		if (orig_TriggerLuaEventExtended) {
+			return orig_TriggerLuaEventExtended( /* truyền đủ các tham số gốc */ );
+		}
+		return 0;  // hoặc giá trị default phù hợp
 	}
 
 	lua_State* L = g_lua_state.load();
 	if (L == nullptr) {
-		LOG("TriggerLuaEventExtended_Hook: lua_State NULL dù có LuaInterface!");
-		return orig_TriggerLuaEventExtended(params...);
+		LOG("TriggerLuaEventExtended_Hook: lua_State NULL dù có LuaInterface");
+		if (orig_TriggerLuaEventExtended) {
+			return orig_TriggerLuaEventExtended( /* params */ );
+		}
+		return 0;
 	}
 
-	// Bây giờ dùng được
-	LOG("TriggerLuaEventExtended_Hook: OK - LuaInterface = %p, lua_State = %p", lua_interface, L);
-
+	// OK, tiếp tục dùng lua_interface và L
+	LOG("TriggerLuaEventExtended_Hook OK - LuaInterface %p | lua_State %p", lua_interface, L);
 	// Tiếp tục logic của bạn: push params, lua_getglobal(L, "LuaFnEquipTransToNew"), lua_call...
 
     if (!g_exe_script_ddddddddddd) {
@@ -1193,7 +1209,7 @@ pthread_once_t ServerHook::once_control = PTHREAD_ONCE_INIT;
 ============================================================ */
 __attribute__((constructor))
 void init() {
-	//resolve_exe_script_func(); //ExeScript_DDDDDDDDDDD
+	resolve_exe_script_func(); //ExeScript_DDDDDDDDDDD
 	resolve_lua_interface();  // Gọi để dlsym Init
     // Chỉ khởi tạo instance, đảm bảo thread-safe
     ServerHook::getInstance();
