@@ -1077,7 +1077,7 @@ int64_t skill005_hook(void* _this, unsigned int* a2, int a3) {
     //int v8 = send_impact(impact_core, a2, (unsigned short)v6, a2[2], 1, 100);
     LOG("SendImpact result=%d", v8);
 
-    if (!v8) {
+    if (v8 <= 0) {
         LOG("SendImpact FAILED impact=%d", v6);
         return 0;
     }
@@ -1090,8 +1090,9 @@ int64_t skill005_hook(void* _this, unsigned int* a2, int a3) {
 /* ============================================================
    HÀM ScriptGlobal_Format
 ============================================================ */
+static void*                      g_trampoline = nullptr;
 
-typedef int64_t (*ScriptGlobal_Format_tt)(
+typedef int64_t (*ScriptGlobal_Format_t)(
     char* dest,
     int len,
     const char* fmt,
@@ -1099,23 +1100,201 @@ typedef int64_t (*ScriptGlobal_Format_tt)(
     ...
 );
 
-static ScriptGlobal_Format_tt g_orig_ScriptGlobal_Formatt = nullptr;
-static void* g_trampoline = nullptr;
+static ScriptGlobal_Format_t g_orig_ScriptGlobal_Format = nullptr;
 
+// ============================================================
+// HEX DUMP DEBUG
+// ============================================================
+
+static void dump_hex(const char* tag, const void* data, size_t len)
+{
+    if (!data || len == 0)
+        return;
+
+    const unsigned char* p = (const unsigned char*)data;
+
+    LOG("---- %s (len=%zu) ----", tag, len);
+
+    char line[256];
+    int pos = 0;
+
+    for (size_t i = 0; i < len; ++i)
+    {
+        pos += sprintf(line + pos, "%02X ", p[i]);
+
+        if ((i + 1) % 16 == 0 || i == len - 1)
+        {
+            LOG("%s", line);
+            pos = 0;
+        }
+    }
+}
+
+// ============================================================
+// SCRIPT GLOBAL FORMAT HOOK (FINAL STABLE VERSION)
+// ============================================================
 int64_t ScriptGlobal_Format_Hook(
+    char* dest,
+    int len,
+    const char* key,
+    ...)
+{
+    if (!dest || !key || len <= 0)
+        return 0;
+
+    va_list ap;
+    va_start(ap, key);
+
+    const char* arg0 = va_arg(ap, const char*);
+    va_end(ap);
+
+    LOG("key=%s arg0=%s", key, arg0 ? arg0 : "(null)");
+
+    const char* format = GetTextByKey(key);
+    if (!format)
+        return 0;
+
+    std::string fmt = format;
+
+    size_t pos = fmt.find("%s0");
+    if (pos != std::string::npos)
+        fmt.replace(pos, 3, "%s");
+
+    char buffer[1024];
+    snprintf(buffer, sizeof(buffer), fmt.c_str(), arg0 ? arg0 : "");
+
+    strncpy(dest, buffer, len - 1);
+    dest[len - 1] = 0;
+
+    LOG("FINAL TEXT: %s", dest);
+
+    return 1;
+}
+
+
+//lúc nãy key đã được ghi vào cuối chuỗi, giờ bạn chỉ cần thay key vào %s0 %s1 %s2 %s3 .... ScriptGlobal_Format("TalentMP_20210804_12",key1, key2,key3,key4....)  hàm lúc nãy của bạn: 
+
+int ScriptGlobal_Format_Hook_xx(
+    char* dest,
+    int   dest_len,
+    const char* fmt,
+    int   count,
+    const char** args)
+{
+    LOG("===== ScriptGlobal_Format ENTER =====");
+
+    if (!dest || !fmt)
+    {
+        LOG("Invalid param -> call original");
+        return g_orig_ScriptGlobal_Format(dest, dest_len, fmt, count, args);
+    }
+
+    LOG("dest=%p len=%d fmt=%s count=%d",
+        dest, dest_len, fmt, count);
+
+    // -------------------------------------------------
+    // Nếu không có %sX thì dùng hàm gốc
+    // -------------------------------------------------
+
+    if (!strstr(fmt, "%s"))
+    {
+        LOG("No placeholder -> fallback original");
+        return g_orig_ScriptGlobal_Format(dest, dest_len, fmt, count, args);
+    }
+
+    // -------------------------------------------------
+    // Copy format gốc vào buffer tạm
+    // -------------------------------------------------
+
+    char buffer[4096];
+    memset(buffer, 0, sizeof(buffer));
+    strncpy(buffer, fmt, sizeof(buffer) - 1);
+
+    // -------------------------------------------------
+    // Replace %s0 %s1 %s2 ...
+    // -------------------------------------------------
+
+    for (int i = 0; i < count; i++)
+    {
+        if (!args[i])
+            continue;
+
+        char tag[16];
+        snprintf(tag, sizeof(tag), "%%s%d", i);
+
+        char* pos = strstr(buffer, tag);
+        if (!pos)
+        {
+            LOG("Placeholder %s not found", tag);
+            continue;
+        }
+
+        LOG("Replacing %s -> %s", tag, args[i]);
+
+        char temp[4096];
+        size_t before = pos - buffer;
+
+        snprintf(temp, sizeof(temp), "%.*s%s%s",
+                 (int)before,
+                 buffer,
+                 args[i],
+                 pos + strlen(tag));
+
+        strncpy(buffer, temp, sizeof(buffer) - 1);
+    }
+
+    // -------------------------------------------------
+    // Copy kết quả vào dest
+    // -------------------------------------------------
+
+    size_t final_len = strlen(buffer);
+
+    if (final_len >= (size_t)dest_len)
+    {
+        LOG("Overflow detected -> fallback original");
+        return g_orig_ScriptGlobal_Format(dest, dest_len, fmt, count, args);
+    }
+
+    memset(dest, 0, dest_len);
+    memcpy(dest, buffer, final_len);
+
+    LOG("FINAL STRING: %s", dest);
+
+    // -------------------------------------------------
+    // HEXDUMP
+    // -------------------------------------------------
+
+    LOG("---- FINAL HEX (len=%zu) ----", final_len);
+
+    for (size_t i = 0; i < final_len; i++)
+    {
+        printf("%02X ", (unsigned char)dest[i]);
+        if ((i + 1) % 16 == 0)
+            printf("\n");
+    }
+    printf("\n");
+
+    LOG("===== ScriptGlobal_Format EXIT =====");
+
+    return 1;
+}
+
+
+
+int64_t ScriptGlobal_Format_Hook_bak(
         char *dest,
         int a2,
         const char *a3,
         int a4,
         ...)
 {
-    DebugLog("===== ScriptGlobal_Format ENTER =====");
-    DebugLog("dest=%p len=%d fmt=%s count=%d",
+    LOG("===== ScriptGlobal_Format ENTER =====");
+    LOG("dest=%p len=%d fmt=%s count=%d",
              dest, a2, a3 ? a3 : "(null)", a4);
 
     if (!dest || a2 <= 0)
     {
-        DebugLog("Invalid dest buffer");
+        LOG("Invalid dest buffer");
         return 0;
     }
 
@@ -1126,7 +1305,7 @@ int64_t ScriptGlobal_Format_Hook(
 
     if (!a3)
     {
-        DebugLog("fmt NULL");
+        LOG("fmt NULL");
         va_end(va);
         return 0;
     }
@@ -1151,7 +1330,7 @@ int64_t ScriptGlobal_Format_Hook(
 
         if (a2 <= v16 + 2)
         {
-            DebugLog("Buffer too small after header");
+            LOG("Buffer too small after header");
             va_end(va);
             return 0;
         }
@@ -1161,14 +1340,14 @@ int64_t ScriptGlobal_Format_Hook(
 
         while (1)
         {
-            const char* v23 = va_arg(va, const char*);// fix cho nay
+            const char* v23 = va_arg(va, const char*);
 			
 			
-            DebugLog("arg[%d]=%p", v19, v23);
+            LOG("arg[%d]=%p", v19, v23);
 
             if (!v23)
             {
-                DebugLog("arg NULL");
+                LOG("arg NULL");
                 va_end(va);
                 return 0;
             }
@@ -1178,7 +1357,7 @@ int64_t ScriptGlobal_Format_Hook(
 
             if (v18 + 2 + v25 >= a2)
             {
-                DebugLog("Prevented overflow");
+                LOG("Prevented overflow");
                 va_end(va);
                 return 0;
             }
@@ -1234,8 +1413,8 @@ int64_t ScriptGlobal_Format_Hook(
                 dest[v16] = v19;
                 dest[v16 + 1] = v20 + 3;
 
-                DebugLog("final arg_count=%d payload=%d", v19, v20 + 3);
-                DebugLog("FINAL STRING: %s", dest);
+                LOG("final arg_count=%d payload=%d", v19, v20 + 3);
+                LOG("FINAL STRING: %s", dest);
 
                 va_end(va);
                 return 1;
@@ -1243,43 +1422,12 @@ int64_t ScriptGlobal_Format_Hook(
         }
     }
 
-    DebugLog("Buffer too small for format");
+    LOG("Buffer too small for format");
     va_end(va);
     return result;
 }
 
-// ==========================================================
-// TYPEDEF
-// ==========================================================
-using LuaFnScriptGlobal_Format_t = int64_t (*)(lua_State*);
 
-static LuaFnScriptGlobal_Format_t g_orig_LuaFnScriptGlobal_Format = nullptr;
-
-// ==========================================================
-// HOOK FUNCTION
-// ==========================================================
-extern "C"
-int64_t LuaFnScriptGlobal_Format_Hook(lua_State* L)
-{
-    LOG("========== LuaFnScriptGlobal_Format_Hook ==========");
-
-    if (!L)
-        return 0;
-
-    int top = lua_gettop(L);
-    LOG("lua_gettop = %d", top);
-
-    for (int i = 1; i <= top; ++i)
-    {
-        int t = lua_type(L, i);
-        LOG("Stack[%d] type = %s",
-            i, lua_typename(L, t));
-    }
-
-    LOG("SKIP ORIGINAL -> RETURN 0");
-
-    return 0;
-}
 
 /* ============================================================
    INITIALIZATION - THREAD SAFE, CHỈ 1 LẦN
@@ -1335,7 +1483,7 @@ private:
 		// Tạo thread riêng để hook skill sau x giây (không block thread chính)
 		std::thread([this]() {
 			//sleep(45); // Hoặc 
-			std::this_thread::sleep_for(std::chrono::seconds(45));
+		//	std::this_thread::sleep_for(std::chrono::seconds(45));
 			// Hook FoxLuaScript::RegisterFunction ngay lập tức
 			LOG("Attempting to hook ScriptGlobal_Format...");
 
@@ -1348,7 +1496,7 @@ private:
 				return;
 			}
 
-			g_orig_ScriptGlobal_Formatt = (ScriptGlobal_Format_tt)g_trampoline;
+			g_orig_ScriptGlobal_Format = (ScriptGlobal_Format_t)g_trampoline;
 
 			HookEngine::patch_code_safe(
 				(void*)target,
@@ -1359,36 +1507,7 @@ private:
 
 		}).detach(); // detach để thread tự quản lý
 		
-		//------------------------------------------LuaFnScriptGlobal_Format_Hook----------------------------------------------//
-		std::thread([this]() {
 
-			//std::this_thread::sleep_for(std::chrono::seconds(45));
-
-			LOG("Attempting to hook LuaFnScriptGlobal_Format...");
-
-			uintptr_t offset = 0x8CF6E0;  // offset bạn cung cấp
-
-			LOG("LuaFnScriptGlobal_Format runtime addr: %p", (void*)offset);
-
-			g_trampoline = HookEngine::create_trampoline((void*)offset, 32);
-			if (!g_trampoline)
-			{
-				LOG("create_trampoline failed");
-				return;
-			}
-
-			// ⚠ Kiểu phải đúng prototype
-			g_orig_LuaFnScriptGlobal_Format =
-				(LuaFnScriptGlobal_Format_t)g_trampoline;
-
-			HookEngine::patch_code_safe(
-				(void*)offset,
-				(void*)LuaFnScriptGlobal_Format_Hook
-			);
-
-			LOG("LuaFnScriptGlobal_Format hooked successfully");
-
-		}).detach();
 		//------------------------------------------fix thu cuoi----------------------------------------------//
 		// Tạo thread riêng để hook skill sau 45 giây (không block thread chính)
 		std::thread([this]() {
