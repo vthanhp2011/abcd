@@ -730,8 +730,11 @@ int64_t skill005_hook(void* _this, unsigned int* a2, int a3) {
 
 //lay ra ham lua co tren sv strings ./libLuaLib.so | grep -i '^lua_' | sort | uniq > lua_symbols.txt
 //g++ -shared -fPIC -O2 -std=c++14 -pthread \
-    -I/usr/include/lua5.1 \
+    -I/home/tlbb/Server/Lua \
     hook_so.cpp -ldl -o hook_so.so
+
+//strings ./Server | grep -i -C 10 "TriggerLuaEventExtended" > TriggerLuaEventExtended.txt
+//strings ./Server | grep -i "LuaFnTbl\|BeginEvent\|AddText\|AddNumber\|CallScriptFunction" > lua_cpp2.txt
 /* ============================================================
    FOXLUA SCRIPT REGISTER FUNCTION - THEO PSEUDOCODE
 ============================================================ */
@@ -789,6 +792,158 @@ extern "C" {
 }
 */
 /* ============================================================
+   HOOK THÊM HÀM VÀO GS
+============================================================ */
+int FoxRegisterFunction_Hook(void* this_void_ptr, const char* func_name, void* func_ptr) {
+    // Cast an toàn sang LuaInterface* (server truyền đúng loại)
+    LuaInterface* this_ptr = static_cast<LuaInterface*>(this_void_ptr);
+
+    // Log debug (bật nếu cần, comment khi ổn định)
+    // LOG("FoxRegisterFunction_Hook: this_ptr=%p, func_name=%s, func_ptr=%p", this_ptr, func_name ? func_name : "NULL", func_ptr);
+
+    if (!g_orig_FoxRegisterFunction) {
+        LOG("ERROR: g_orig_FoxRegisterFunction is NULL!");
+        return 0;
+    }
+
+    if (!func_name) {
+        LOG("WARNING: func_name is NULL, skipping original call");
+        return 0;
+    }
+
+    // Gọi hàm gốc để đăng ký hàm hiện tại
+    int ret = g_orig_FoxRegisterFunction(this_void_ptr, func_name, func_ptr);
+    //LOG("Original function registered: %s (ret=%d)", func_name, ret);
+
+    // Lưu LuaInterface* ngay lần đầu (điểm mấu chốt để lấy this_ptr)
+    if (g_lua_interface.load() == nullptr) {
+        g_lua_interface.store(this_ptr);
+        LOG("[FoxRegisterFunction_Hook] Lưu LuaInterface* = %p", this_ptr);
+    }
+
+    // Chỉ inject một lần duy nhất sau ScriptGlobal_Format
+    if (!g_lua_injected.load(std::memory_order_acquire) && 
+        strcmp(func_name, "ScriptGlobal_Format") == 0) {
+        
+        pthread_mutex_lock(&g_lua_mutex);
+        if (!g_lua_injected.load(std::memory_order_acquire)) {
+            LOG("=== BATCH INJECTING LUA FUNCTIONS ===");
+            
+            // Định nghĩa mảng các hàm Lua cần inject
+            const struct {
+                const char* name;
+                lua_CFunction func;
+            } luaFunctions[] = {
+                // ===== THÊM CÁC HÀM LUA CỦA BẠN VÀO ĐÂY =====
+                {"LuaFnGetAccountName", LuaFnGetAccountName},
+                {"LuaFnEquipTransToNew", LuaFnEquipTransToNew},
+                // =============================================
+            };
+            
+            const int numFunctions = sizeof(luaFunctions) / sizeof(luaFunctions[0]);
+            int successCount = 0;
+            
+            for (int i = 0; i < numFunctions; i++) {
+                LOG("Injecting [%d/%d] %s...", i + 1, numFunctions, luaFunctions[i].name);
+                
+                int injectRet = g_orig_FoxRegisterFunction(this_ptr,luaFunctions[i].name,(void*)luaFunctions[i].func);
+                
+                if (injectRet == 1) {
+                    successCount++;
+                    LOG("  ✓ %s injected successfully", luaFunctions[i].name);
+                } else {
+                    LOG("  ✗ %s injection failed (ret=%d)", luaFunctions[i].name, injectRet);
+                }
+            }
+            
+            if (successCount == numFunctions) {
+                LOG("=== ALL %d LUA FUNCTIONS INJECTED SUCCESSFULLY ===", numFunctions);
+            } else {
+                LOG("=== INJECTED %d/%d LUA FUNCTIONS (SOME FAILED) ===", successCount, numFunctions);
+            }
+            
+            g_lua_injected.store(true, std::memory_order_release);
+        }
+        pthread_mutex_unlock(&g_lua_mutex);
+    }
+
+    //LOG("<<< FoxRegisterFunction_Hook EXITED, returning %d", ret);
+    return ret;
+}
+
+
+extern "C"
+int FoxRegisterFunction_Hook_bak(void* this_ptr, const char* func_name, void* func_ptr) {
+/*
+    LOG(">>> FoxRegisterFunction_Hook ENTERED");
+    LOG("    this_ptr: %p", this_ptr);
+    LOG("    func_name: %s", func_name ? func_name : "NULL");
+    LOG("    func_ptr: %p", func_ptr);
+*/
+
+    if (!g_orig_FoxRegisterFunction) {
+        LOG("ERROR: g_orig_FoxRegisterFunction is NULL!");
+        return 0;
+    }
+
+    if (!func_name) {
+        LOG("WARNING: func_name is NULL, skipping original call");
+        return 0;
+    }
+
+    int ret = g_orig_FoxRegisterFunction(this_ptr, func_name, func_ptr);
+    //LOG("Original function registered: %s (ret=%d)", func_name, ret);
+
+    // Chỉ inject một lần duy nhất sau ScriptGlobal_Format
+    if (!g_lua_injected.load(std::memory_order_acquire) && 
+        strcmp(func_name, "ScriptGlobal_Format") == 0) {
+        
+        pthread_mutex_lock(&g_lua_mutex);
+        if (!g_lua_injected.load(std::memory_order_acquire)) {
+            LOG("=== BATCH INJECTING LUA FUNCTIONS ===");
+            
+            // Định nghĩa mảng các hàm Lua cần inject
+            const struct {
+                const char* name;
+                lua_CFunction func;
+            } luaFunctions[] = {
+                // ===== THÊM CÁC HÀM LUA CỦA BẠN VÀO ĐÂY =====
+                {"LuaFnGetAccountName", LuaFnGetAccountName},
+                {"LuaFnEquipTransToNew", LuaFnEquipTransToNew},
+                // =============================================
+            };
+            
+            const int numFunctions = sizeof(luaFunctions) / sizeof(luaFunctions[0]);
+            int successCount = 0;
+            
+            for (int i = 0; i < numFunctions; i++) {
+                LOG("Injecting [%d/%d] %s...", i + 1, numFunctions, luaFunctions[i].name);
+                
+                int injectRet = g_orig_FoxRegisterFunction(this_ptr,luaFunctions[i].name,(void*)luaFunctions[i].func);
+                
+                if (injectRet == 1) {
+                    successCount++;
+                    LOG("  ✓ %s injected successfully", luaFunctions[i].name);
+                } else {
+                    LOG("  ✗ %s injection failed (ret=%d)", luaFunctions[i].name, injectRet);
+                }
+            }
+            
+            if (successCount == numFunctions) {
+                LOG("=== ALL %d LUA FUNCTIONS INJECTED SUCCESSFULLY ===", numFunctions);
+            } else {
+                LOG("=== INJECTED %d/%d LUA FUNCTIONS (SOME FAILED) ===", successCount, numFunctions);
+            }
+            
+            g_lua_injected.store(true, std::memory_order_release);
+        }
+        pthread_mutex_unlock(&g_lua_mutex);
+    }
+
+    //LOG("<<< FoxRegisterFunction_Hook EXITED, returning %d", ret);
+    return ret;
+}
+/* ============================================================
    HÀM CALL SCRIPT
 ============================================================ */
 
@@ -805,21 +960,6 @@ extern "C" {
     );
 }
 
-void resolve_lua_interface() {
-    if (g_lua_interface.load() != nullptr) return;
-
-    // Nếu bạn dùng offset hardcode (ví dụ từ IDA)
-    uintptr_t base = (uintptr_t)dlopen(NULL, RTLD_LAZY);  // base của main binary
-    uintptr_t lua_interface_offset = base + 0x123456;     // THAY BẰNG OFFSET THẬT BẠN TÌM ĐƯỢC
-
-    LuaInterface* ptr = *(LuaInterface**)lua_interface_offset;
-    if (ptr) {
-        g_lua_interface.store(ptr);
-        LOG("resolve_lua_interface: Lưu LuaInterface* từ offset = %p", ptr);
-    } else {
-        LOG("resolve_lua_interface: Không tìm thấy LuaInterface từ offset");
-    }
-}
 
 // Biến toàn cục
 static void* g_exe_script_ddddddddddd = nullptr;
@@ -894,6 +1034,19 @@ void TriggerLuaEventExtended_Hook(
         script_id, event_name, result);
 }
 
+#define TRIGGER_LUA_EVENT(script_id, event, scene, self, target) \
+    TriggerLuaEventExtended_Hook( \
+        (unsigned int)(script_id), \
+        (event), \
+        (int)(scene), \
+        (int)(self), \
+        (int)(target), \
+        -1, 0, 0, 0, 0, 0, 0, 0, 0, 0 \
+    )
+
+// Sử dụng
+//TRIGGER_LUA_EVENT(2116, "OnDefaultEvent", scene_id, obj_id, obj_id);
+
 static double safe_get_number(lua_State *L, int idx, double fallback = 0.0) {
     if (lua_isnumber(L, idx)) {
         return lua_tonumber(L, idx);
@@ -944,16 +1097,8 @@ extern "C" int LuaFnEquipTransToNew(lua_State *L) {
         return 1;
     }
 	
+	TRIGGER_LUA_EVENT(2116, "OnDefaultEvent", scene_id, obj_id, obj_id);
 	
-	TriggerLuaEventExtended_Hook(
-		002116,               // script_id từ tên file x750010_...
-		"OnDefaultEvent",     // event wrapper
-		scene_id,                 // p1: sceneId
-		obj_id,                 // p2: selfId
-		obj_id,                 // p3: targetId
-		-1,                   // p4
-		0, 0, 0, 0, 0, 0, 0   // các param còn lại (thường 0 hoặc -1)
-	);
     LOG("EquipTransToNew success (placeholder offsets)");
     lua_pushnumber(L, 1.0);
     return 1;
@@ -980,152 +1125,7 @@ extern "C" int LuaFnGetAccountName(lua_State *L) {
     return 1;
 }
 
-/* ============================================================
-   HOOK THÊM HÀM VÀO GS
-============================================================ */
-// Hàm mới: convert từ hàm cũ, giữ cấu trúc đăng ký hàng loạt
-void FoxRegisterFunction_Hook(LuaInterface* this_ptr) {
-    // 1. Gọi hàm gốc trước để đăng ký hết hàm cũ (rất quan trọng!)
-    if (orig_FoxRegisterFunction) {
-        (this_ptr->*orig_FoxRegisterFunction)();
-    }
 
-    // 2. Lưu LuaInterface* ngay lập tức (đây là điểm mấu chốt)
-    if (g_lua_interface.load() == nullptr) {
-        g_lua_interface.store(this_ptr);
-        LOG("[FoxRegisterFunction_Hook] Lưu LuaInterface* = %p", this_ptr);
-    }
-
-    // 3. Lấy lua_State* từ LuaInterface (dùng offset thử nghiệm)
-    lua_State* L = nullptr;
-    static const uintptr_t offsets[] = {0x4, 0x8, 0x10, 0x18, 0x20, 0x58, 0x60, 0x68};
-
-    for (auto off : offsets) {
-        lua_State** ppL = (lua_State**)((uintptr_t)this_ptr + off);
-        lua_State* candidate = ppL ? *ppL : nullptr;
-        if (candidate && lua_gettop(candidate) >= 0) {
-            L = candidate;
-            LOG("[FoxRegisterFunction_Hook] Tìm thấy lua_State* = %p tại offset 0x%lx", L, off);
-            break;
-        }
-    }
-
-    if (L == nullptr) {
-        LOG("[FoxRegisterFunction_Hook] Không lấy được lua_State* - đăng ký hàm mới thất bại");
-        return;
-    }
-
-    // Lưu lua_State để dùng ở các hook khác
-    if (g_lua_state.load() == nullptr) {
-        g_lua_state.store(L);
-    }
-
-    // 4. Giữ nguyên cấu trúc đăng ký hàng loạt (convert từ hàm cũ)
-    // Cách 1: Nếu hàm cũ dùng vòng lặp mảng
-    static const struct LuaFnEntry {
-        const char*     name;
-        lua_CFunction   func;
-    } newFunctions[] = {
-        {"LuaFnEquipTransToNew", LuaFnEquipTransToNew},
-        // Thêm các hàm mới khác nếu cần
-        {"LuaFnGetAccountName", LuaFnGetAccountName},
-        //{nullptr, nullptr}
-    };
-
-    // Đăng ký các hàm mới (giống cách cũ)
-    for (int i = 0; newFunctions[i].name != nullptr; ++i) {
-        lua_pushcfunction(L, newFunctions[i].func);
-        lua_setglobal(L, newFunctions[i].name);
-        LOG("[FoxRegisterFunction_Hook] Đăng ký global: %s", newFunctions[i].name);
-    }
-
-    // Cách 2: Nếu source dùng table LuaFnTbl (thêm vào table nếu tồn tại)
-    lua_getglobal(L, "LuaFnTbl");
-    if (lua_istable(L, -1)) {
-        for (int i = 0; newFunctions[i].name != nullptr; ++i) {
-            lua_pushcfunction(L, newFunctions[i].func);
-            lua_setfield(L, -2, newFunctions[i].name + 5);  // bỏ "LuaFn" nếu cần, ví dụ "EquipTransToNew"
-            LOG("[FoxRegisterFunction_Hook] Đăng ký vào LuaFnTbl: %s", newFunctions[i].name);
-        }
-        lua_pop(L, 1);
-    } else {
-        lua_pop(L, 1);
-    }
-
-    LOG("[FoxRegisterFunction_Hook] Hoàn tất đăng ký hàm mới - giữ nguyên cấu trúc cũ");
-}
-
-extern "C"
-int FoxRegisterFunction_Hook_bak(void* this_ptr, const char* func_name, void* func_ptr) {
-/*
-    LOG(">>> FoxRegisterFunction_Hook ENTERED");
-    LOG("    this_ptr: %p", this_ptr);
-    LOG("    func_name: %s", func_name ? func_name : "NULL");
-    LOG("    func_ptr: %p", func_ptr);
-*/
-
-    if (!g_orig_FoxRegisterFunction) {
-        LOG("ERROR: g_orig_FoxRegisterFunction is NULL!");
-        return 0;
-    }
-
-    if (!func_name) {
-        LOG("WARNING: func_name is NULL, skipping original call");
-        return 0;
-    }
-
-    int ret = g_orig_FoxRegisterFunction(this_ptr, func_name, func_ptr);
-    //LOG("Original function registered: %s (ret=%d)", func_name, ret);
-
-    // Chỉ inject một lần duy nhất sau ScriptGlobal_Format
-    if (!g_lua_injected.load(std::memory_order_acquire) && 
-        strcmp(func_name, "ScriptGlobal_Format") == 0) {
-        
-        pthread_mutex_lock(&g_lua_mutex);
-        if (!g_lua_injected.load(std::memory_order_acquire)) {
-            LOG("=== BATCH INJECTING LUA FUNCTIONS ===");
-            
-            // Định nghĩa mảng các hàm Lua cần inject
-            const struct {
-                const char* name;
-                lua_CFunction func;
-            } luaFunctions[] = {
-                // ===== THÊM CÁC HÀM LUA CỦA BẠN VÀO ĐÂY =====
-                {"LuaFnGetAccountName", LuaFnGetAccountName},
-                {"LuaFnEquipTransToNew", LuaFnEquipTransToNew},
-                // =============================================
-            };
-            
-            const int numFunctions = sizeof(luaFunctions) / sizeof(luaFunctions[0]);
-            int successCount = 0;
-            
-            for (int i = 0; i < numFunctions; i++) {
-                LOG("Injecting [%d/%d] %s...", i + 1, numFunctions, luaFunctions[i].name);
-                
-                int injectRet = g_orig_FoxRegisterFunction(this_ptr,luaFunctions[i].name,(void*)luaFunctions[i].func);
-                
-                if (injectRet == 1) {
-                    successCount++;
-                    LOG("  ✓ %s injected successfully", luaFunctions[i].name);
-                } else {
-                    LOG("  ✗ %s injection failed (ret=%d)", luaFunctions[i].name, injectRet);
-                }
-            }
-            
-            if (successCount == numFunctions) {
-                LOG("=== ALL %d LUA FUNCTIONS INJECTED SUCCESSFULLY ===", numFunctions);
-            } else {
-                LOG("=== INJECTED %d/%d LUA FUNCTIONS (SOME FAILED) ===", successCount, numFunctions);
-            }
-            
-            g_lua_injected.store(true, std::memory_order_release);
-        }
-        pthread_mutex_unlock(&g_lua_mutex);
-    }
-
-    //LOG("<<< FoxRegisterFunction_Hook EXITED, returning %d", ret);
-    return ret;
-}
 
 /* ============================================================
    INITIALIZATION - THREAD SAFE, CHỈ 1 LẦN
@@ -1167,7 +1167,9 @@ private:
 			if (trampoline) {
 				g_orig_FoxRegisterFunction = (FoxLuaScript_RegisterFunction_t)trampoline;
 				LOG("Patching...");
+				LOG("Patching TriggerLuaEventExtended at addr %p to hook %p", fox_addr, (void*)TriggerLuaEventExtended_Hook);
 				HookEngine::patch_code_safe(fox_addr, (void*)FoxRegisterFunction_Hook);
+				//HookEngine::patch_code_safe(fox_addr, (void*)TriggerLuaEventExtended_Hook);  // hoặc FoxRegisterFunction_Hook
 				
 				LOG("FoxLuaScript::RegisterFunction hooked with trampoline");
 			} else {
@@ -1180,7 +1182,7 @@ private:
 		// Tạo thread riêng để hook skill sau 45 giây (không block thread chính)
 		std::thread([this]() {
 			//sleep(30); // Hoặc 
-			std::this_thread::sleep_for(std::chrono::seconds(45));
+			std::this_thread::sleep_for(std::chrono::seconds(50));
 			
 			void* skill_addr = dlsym(RTLD_DEFAULT, 
 				"_ZNK13Combat_Module12Skill_Module16CommonSkill005_T16EffectOnUnitOnceER13Obj_CharacterS3_i");
@@ -1215,8 +1217,7 @@ pthread_once_t ServerHook::once_control = PTHREAD_ONCE_INIT;
 ============================================================ */
 __attribute__((constructor))
 void init() {
-	//resolve_exe_script_func(); //ExeScript_DDDDDDDDDDD
-	//resolve_lua_interface(); // chưa có offset hoặc dlsym chưa dùng đượcs
+	resolve_exe_script_func(); //ExeScript_DDDDDDDDDDD
     // Chỉ khởi tạo instance, đảm bảo thread-safe
     ServerHook::getInstance();
 }
