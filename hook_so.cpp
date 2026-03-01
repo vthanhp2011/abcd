@@ -19,12 +19,15 @@
 #include <cstdint>
 #include <thread>
 
-// khai bao lua 5.0.3
+// khai bao lua 5.0.1 - 5.0.3
 extern "C" {
 	#include "lua.h"
 	#include "lauxlib.h"
 	#include "lualib.h"
 }
+
+class LuaInterface;
+
 
 #define HOOK_STUB_SIZE 14
 #define TRAMPOLINE_COPY_SIZE 32
@@ -53,6 +56,13 @@ static std::atomic<bool> g_enable_log{true};
 static const char* LOG_PATH = "/home/tlbb/Server/Log/";
 
 static pthread_mutex_t g_patch_mutex = PTHREAD_MUTEX_INITIALIZER;
+// Đầu file: khai báo global (nếu chưa có)
+std::atomic<LuaInterface*> g_lua_interface{nullptr};
+std::atomic<lua_State*>    g_lua_state{nullptr};
+
+// Typedef cho hàm gốc (nếu bạn hook bằng member pointer)
+typedef void (LuaInterface::*RegFn)();
+static RegFn orig_FoxRegisterFunction = nullptr;
 
 /* ============================================================
    LOGGER TIÊN TIẾN - THREAD SAFE, KHÔNG BLOCK - CÓ THỜI GIAN
@@ -734,7 +744,6 @@ static pthread_mutex_t g_lua_mutex = PTHREAD_MUTEX_INITIALIZER;
 // Định nghĩa các hàm Lua cần thiết nếu không có header
 typedef struct lua_State lua_State;
 typedef int (*lua_CFunction)(lua_State *L);
-static void* g_lua_interface = nullptr;          // LuaInterface*
 
 //khai báo
 extern "C" {
@@ -980,8 +989,80 @@ extern "C" int LuaFnGetAccountName(lua_State *L) {
 /* ============================================================
    HOOK THÊM HÀM VÀO GS
 ============================================================ */
+// Hàm mới: convert từ hàm cũ, giữ cấu trúc đăng ký hàng loạt
+void FoxRegisterFunction_Hook(LuaInterface* this_ptr) {
+    // 1. Gọi hàm gốc trước để đăng ký hết hàm cũ (rất quan trọng!)
+    if (orig_FoxRegisterFunction) {
+        (this_ptr->*orig_FoxRegisterFunction)();
+    }
+
+    // 2. Lưu LuaInterface* ngay lập tức (đây là điểm mấu chốt)
+    if (g_lua_interface.load() == nullptr) {
+        g_lua_interface.store(this_ptr);
+        LOG("[FoxRegisterFunction_Hook] Lưu LuaInterface* = %p", this_ptr);
+    }
+
+    // 3. Lấy lua_State* từ LuaInterface (dùng offset thử nghiệm)
+    lua_State* L = nullptr;
+    static const uintptr_t offsets[] = {0x4, 0x8, 0x10, 0x18, 0x20, 0x58, 0x60, 0x68};
+
+    for (auto off : offsets) {
+        lua_State** ppL = (lua_State**)((uintptr_t)this_ptr + off);
+        lua_State* candidate = ppL ? *ppL : nullptr;
+        if (candidate && lua_gettop(candidate) >= 0) {
+            L = candidate;
+            LOG("[FoxRegisterFunction_Hook] Tìm thấy lua_State* = %p tại offset 0x%lx", L, off);
+            break;
+        }
+    }
+
+    if (L == nullptr) {
+        LOG("[FoxRegisterFunction_Hook] Không lấy được lua_State* - đăng ký hàm mới thất bại");
+        return;
+    }
+
+    // Lưu lua_State để dùng ở các hook khác
+    if (g_lua_state.load() == nullptr) {
+        g_lua_state.store(L);
+    }
+
+    // 4. Giữ nguyên cấu trúc đăng ký hàng loạt (convert từ hàm cũ)
+    // Cách 1: Nếu hàm cũ dùng vòng lặp mảng
+    static const struct LuaFnEntry {
+        const char*     name;
+        lua_CFunction   func;
+    } newFunctions[] = {
+        {"LuaFnEquipTransToNew", LuaFnEquipTransToNew},
+        // Thêm các hàm mới khác nếu cần
+        {"LuaFnGetAccountName", LuaFnGetAccountName},
+        //{nullptr, nullptr}
+    };
+
+    // Đăng ký các hàm mới (giống cách cũ)
+    for (int i = 0; newFunctions[i].name != nullptr; ++i) {
+        lua_pushcfunction(L, newFunctions[i].func);
+        lua_setglobal(L, newFunctions[i].name);
+        LOG("[FoxRegisterFunction_Hook] Đăng ký global: %s", newFunctions[i].name);
+    }
+
+    // Cách 2: Nếu source dùng table LuaFnTbl (thêm vào table nếu tồn tại)
+    lua_getglobal(L, "LuaFnTbl");
+    if (lua_istable(L, -1)) {
+        for (int i = 0; newFunctions[i].name != nullptr; ++i) {
+            lua_pushcfunction(L, newFunctions[i].func);
+            lua_setfield(L, -2, newFunctions[i].name + 5);  // bỏ "LuaFn" nếu cần, ví dụ "EquipTransToNew"
+            LOG("[FoxRegisterFunction_Hook] Đăng ký vào LuaFnTbl: %s", newFunctions[i].name);
+        }
+        lua_pop(L, 1);
+    } else {
+        lua_pop(L, 1);
+    }
+
+    LOG("[FoxRegisterFunction_Hook] Hoàn tất đăng ký hàm mới - giữ nguyên cấu trúc cũ");
+}
+
 extern "C"
-int FoxRegisterFunction_Hook(void* this_ptr, const char* func_name, void* func_ptr) {
+int FoxRegisterFunction_Hook_bak(void* this_ptr, const char* func_name, void* func_ptr) {
 /*
     LOG(">>> FoxRegisterFunction_Hook ENTERED");
     LOG("    this_ptr: %p", this_ptr);
@@ -1093,6 +1174,7 @@ private:
 				g_orig_FoxRegisterFunction = (FoxLuaScript_RegisterFunction_t)trampoline;
 				LOG("Patching...");
 				HookEngine::patch_code_safe(fox_addr, (void*)FoxRegisterFunction_Hook);
+				
 				LOG("FoxLuaScript::RegisterFunction hooked with trampoline");
 			} else {
 				LOG("ERROR: Cannot create trampoline");
@@ -1104,7 +1186,7 @@ private:
 		// Tạo thread riêng để hook skill sau 45 giây (không block thread chính)
 		std::thread([this]() {
 			//sleep(30); // Hoặc 
-			std::this_thread::sleep_for(std::chrono::seconds(35));
+			std::this_thread::sleep_for(std::chrono::seconds(45));
 			
 			void* skill_addr = dlsym(RTLD_DEFAULT, 
 				"_ZNK13Combat_Module12Skill_Module16CommonSkill005_T16EffectOnUnitOnceER13Obj_CharacterS3_i");
