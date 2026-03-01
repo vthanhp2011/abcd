@@ -729,10 +729,7 @@ int64_t skill005_hook(void* _this, unsigned int* a2, int a3) {
 }
 
 //lay ra ham lua co tren sv strings ./libLuaLib.so | grep -i '^lua_' | sort | uniq > lua_symbols.txt
-//g++ -shared -fPIC -O2 -std=c++14 -pthread \
-    -I/home/tlbb/Server/Lua \
-    hook_so.cpp -ldl -o hook_so.so
-
+//g++ -shared -fPIC -O2 -std=c++14 -pthread -I/home/tlbb/Server/Lua hook_so.cpp -ldl -o hook_so.so
 //strings ./Server | grep -i -C 10 "TriggerLuaEventExtended" > TriggerLuaEventExtended.txt
 //strings ./Server | grep -i "LuaFnTbl\|BeginEvent\|AddText\|AddNumber\|CallScriptFunction" > lua_cpp2.txt
 /* ============================================================
@@ -871,78 +868,6 @@ int FoxRegisterFunction_Hook(void* this_void_ptr, const char* func_name, void* f
     return ret;
 }
 
-
-extern "C"
-int FoxRegisterFunction_Hook_bak(void* this_ptr, const char* func_name, void* func_ptr) {
-/*
-    LOG(">>> FoxRegisterFunction_Hook ENTERED");
-    LOG("    this_ptr: %p", this_ptr);
-    LOG("    func_name: %s", func_name ? func_name : "NULL");
-    LOG("    func_ptr: %p", func_ptr);
-*/
-
-    if (!g_orig_FoxRegisterFunction) {
-        LOG("ERROR: g_orig_FoxRegisterFunction is NULL!");
-        return 0;
-    }
-
-    if (!func_name) {
-        LOG("WARNING: func_name is NULL, skipping original call");
-        return 0;
-    }
-
-    int ret = g_orig_FoxRegisterFunction(this_ptr, func_name, func_ptr);
-    //LOG("Original function registered: %s (ret=%d)", func_name, ret);
-
-    // Chỉ inject một lần duy nhất sau ScriptGlobal_Format
-    if (!g_lua_injected.load(std::memory_order_acquire) && 
-        strcmp(func_name, "ScriptGlobal_Format") == 0) {
-        
-        pthread_mutex_lock(&g_lua_mutex);
-        if (!g_lua_injected.load(std::memory_order_acquire)) {
-            LOG("=== BATCH INJECTING LUA FUNCTIONS ===");
-            
-            // Định nghĩa mảng các hàm Lua cần inject
-            const struct {
-                const char* name;
-                lua_CFunction func;
-            } luaFunctions[] = {
-                // ===== THÊM CÁC HÀM LUA CỦA BẠN VÀO ĐÂY =====
-                {"LuaFnGetAccountName", LuaFnGetAccountName},
-                {"LuaFnEquipTransToNew", LuaFnEquipTransToNew},
-                // =============================================
-            };
-            
-            const int numFunctions = sizeof(luaFunctions) / sizeof(luaFunctions[0]);
-            int successCount = 0;
-            
-            for (int i = 0; i < numFunctions; i++) {
-                LOG("Injecting [%d/%d] %s...", i + 1, numFunctions, luaFunctions[i].name);
-                
-                int injectRet = g_orig_FoxRegisterFunction(this_ptr,luaFunctions[i].name,(void*)luaFunctions[i].func);
-                
-                if (injectRet == 1) {
-                    successCount++;
-                    LOG("  ✓ %s injected successfully", luaFunctions[i].name);
-                } else {
-                    LOG("  ✗ %s injection failed (ret=%d)", luaFunctions[i].name, injectRet);
-                }
-            }
-            
-            if (successCount == numFunctions) {
-                LOG("=== ALL %d LUA FUNCTIONS INJECTED SUCCESSFULLY ===", numFunctions);
-            } else {
-                LOG("=== INJECTED %d/%d LUA FUNCTIONS (SOME FAILED) ===", successCount, numFunctions);
-            }
-            
-            g_lua_injected.store(true, std::memory_order_release);
-        }
-        pthread_mutex_unlock(&g_lua_mutex);
-    }
-
-    //LOG("<<< FoxRegisterFunction_Hook EXITED, returning %d", ret);
-    return ret;
-}
 /* ============================================================
    HÀM CALL SCRIPT
 ============================================================ */
@@ -1121,7 +1046,120 @@ extern "C" int LuaFnGetAccountName(lua_State *L) {
     LOG("Returning LuaFnGetAccountName: %s", text);
     return 1;
 }
+// Typedef các hàm từ source (dlsym)
+typedef Item* (*GetBagItemFn)(Obj_Human*, uint32_t);                     // HumanItemLogic::GetBagItem
+typedef bool (*MoveBagItemFn)(Obj_Human*, uint32_t, uint32_t);           // HumanItemLogic::MoveBagItem
+typedef bool (*SwapBagItemFn)(Obj_Human*, uint32_t, uint32_t);           // HumanItemLogic::SwapBagItem
+typedef void (*SendItemUpdateFn)(Obj_Human*, uint32_t);                  // Obj_Human::SendItemUpdate (update 1 pos)
 
+// Global con trỏ (resolve một lần)
+static GetBagItemFn orig_GetBagItem = nullptr;
+static MoveBagItemFn orig_MoveBagItem = nullptr;
+static SwapBagItemFn orig_SwapBagItem = nullptr;
+static SendItemUpdateFn orig_SendItemUpdate = nullptr;
+
+// Resolve một lần (gọi trong constructor hoặc đầu hook)
+static void ResolveBagItemFunctions() {
+    if (orig_GetBagItem) return;  // Đã resolve rồi
+
+    orig_GetBagItem     = (GetBagItemFn)dlsym(RTLD_NEXT, "_ZN14HumanItemLogic10GetBagItemEP9Obj_Humanj");
+    orig_MoveBagItem    = (MoveBagItemFn)dlsym(RTLD_NEXT, "_ZN12ItemOperator8MoveItemEP13ItemContainerii");
+    orig_SwapBagItem    = (SwapBagItemFn)dlsym(RTLD_NEXT, "");
+    orig_SendItemUpdate = (SendItemUpdateFn)dlsym(RTLD_NEXT, "");  // tên phổ biến, nếu không có thì thử "_ZN9Obj_Human15SendEquipUpdateEv" hoặc reverse
+
+    if (!orig_GetBagItem)     LOG("WARNING: Không dlsym HumanItemLogic::GetBagItem");
+    if (!orig_MoveBagItem)    LOG("WARNING: Không dlsym HumanItemLogic::MoveBagItem");
+    if (!orig_SwapBagItem)    LOG("WARNING: Không dlsym HumanItemLogic::SwapBagItem");
+    if (!orig_SendItemUpdate) LOG("WARNING: Không dlsym Obj_Human::SendItemUpdate - client có thể không update UI");
+}
+// Hàm Lua mới: Di chuyển item từ pos A sang pos B trong bag (giữ nguyên thuộc tính)
+int LuaFnMoveItemBagPos(lua_State* L) {
+    if (lua_gettop(L) < 4) {
+        LOG("[LuaFnMoveItemBagPos] Thiếu tham số (cần 4: scene_id, human_obj_id, from_pos, to_pos)");
+        lua_pushnumber(L, -1.0);
+        return 1;
+    }
+
+    int scene_id     = (int)lua_tonumber(L, 1);
+    int human_obj_id = (int)lua_tonumber(L, 2);
+    int from_pos     = (int)lua_tonumber(L, 3);
+    int to_pos       = (int)lua_tonumber(L, 4);
+
+    LOG("[LuaFnMoveItemBagPos] Called: scene=%d, human=%d, from=%d, to=%d", scene_id, human_obj_id, from_pos, to_pos);
+
+    // Resolve dlsym
+    ResolveBagItemFunctions();
+
+    // Lấy Scene (từ scene_id - cần dlsym hoặc global)
+    // Ví dụ dlsym cho SceneManager::GetScene(int id)
+    typedef Scene* (*GetSceneFn)(int);
+    static GetSceneFn orig_GetScene = (GetSceneFn)dlsym(RTLD_NEXT, "_ZN12SceneManager12GetSceneInfoEs");  // tên mangled phổ biến
+    Scene* pScene = orig_GetScene ? orig_GetScene(scene_id) : nullptr;
+
+    if (!pScene) {
+        LOG("[LuaFnMoveItemBagPos] Không lấy được Scene cho id %d", scene_id);
+        lua_pushnumber(L, -1.0);
+        return 1;
+    }
+
+    // Lấy Obj_Human từ Scene (m_pObjManager->m_pObj là mảng Obj*)
+    Obj_Human* pHuman = (Obj_Human*)pScene->m_pObjManager->m_pObj[human_obj_id];
+    if (!pHuman || !pHuman->IsHuman()) {
+        LOG("[LuaFnMoveItemBagPos] Obj_Human không hợp lệ hoặc không tồn tại: %d", human_obj_id);
+        lua_pushnumber(L, -1.0);
+        return 1;
+    }
+
+    const int HUMAN_BAG_SIZE = 200;  // Điều chỉnh theo version (thường 60 hoặc 100)
+
+    if (from_pos < 0 || from_pos >= HUMAN_BAG_SIZE ||
+        to_pos < 0 || to_pos >= HUMAN_BAG_SIZE ||
+        from_pos == to_pos) {
+        LOG("[LuaFnMoveItemBagPos] Vị trí không hợp lệ: from=%d, to=%d", from_pos, to_pos);
+        lua_pushnumber(L, -1.0);
+        return 1;
+    }
+
+    // Lấy item nguồn
+    Item* pFromItem = orig_GetBagItem ? orig_GetBagItem(pHuman, from_pos) : nullptr;
+    if (!pFromItem || !pFromItem->IsValid()) {
+        LOG("[LuaFnMoveItemBagPos] Không có item tại vị trí nguồn: %d", from_pos);
+        lua_pushnumber(L, -1.0);
+        return 1;
+    }
+
+    // Lấy item đích
+    Item* pToItem = orig_GetBagItem ? orig_GetBagItem(pHuman, to_pos) : nullptr;
+
+    bool success = false;
+
+    if (!pToItem || !pToItem->IsValid()) {
+        // Move item nếu đích trống
+        if (orig_MoveBagItem) {
+            success = orig_MoveBagItem(pHuman, from_pos, to_pos);
+        } else {
+            LOG("[LuaFnMoveItemBagPos] Không có MoveBagItem - không thể move");
+        }
+    } else {
+        // Swap nếu đích có item
+        if (orig_SwapBagItem) {
+            success = orig_SwapBagItem(pHuman, from_pos, to_pos);
+        } else {
+            LOG("[LuaFnMoveItemBagPos] Không có SwapBagItem - không thể swap");
+        }
+    }
+
+    // Notify client update bag (update 2 vị trí)
+    if (success && orig_SendItemUpdate) {
+        orig_SendItemUpdate(pHuman, from_pos);
+        orig_SendItemUpdate(pHuman, to_pos);
+    } else if (success) {
+        LOG("[LuaFnMoveItemBagPos] Move/Swap thành công nhưng không notify client (không có SendItemUpdate)");
+    }
+
+    lua_pushnumber(L, success ? 1.0 : -1.0);
+    return 1;
+}
 
 
 /* ============================================================
@@ -1164,9 +1202,7 @@ private:
 			if (trampoline) {
 				g_orig_FoxRegisterFunction = (FoxLuaScript_RegisterFunction_t)trampoline;
 				LOG("Patching...");
-				//LOG("Patching TriggerLuaEventExtended at addr %p to hook %p", fox_addr, (void*)TriggerLuaEventExtended_Hook);
 				HookEngine::patch_code_safe(fox_addr, (void*)FoxRegisterFunction_Hook);
-				//HookEngine::patch_code_safe(fox_addr, (void*)TriggerLuaEventExtended_Hook);  // hoặc FoxRegisterFunction_Hook
 				
 				LOG("FoxLuaScript::RegisterFunction hooked with trampoline");
 			} else {
@@ -1179,7 +1215,7 @@ private:
 		// Tạo thread riêng để hook skill sau 45 giây (không block thread chính)
 		std::thread([this]() {
 			//sleep(30); // Hoặc 
-			std::this_thread::sleep_for(std::chrono::seconds(50));
+			std::this_thread::sleep_for(std::chrono::seconds(30));
 			
 			void* skill_addr = dlsym(RTLD_DEFAULT, 
 				"_ZNK13Combat_Module12Skill_Module16CommonSkill005_T16EffectOnUnitOnceER13Obj_CharacterS3_i");
