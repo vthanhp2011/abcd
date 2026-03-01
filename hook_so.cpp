@@ -834,6 +834,7 @@ int FoxRegisterFunction_Hook(void* this_void_ptr, const char* func_name, void* f
                 // ===== THÊM CÁC HÀM LUA CỦA BẠN VÀO ĐÂY =====
                 {"LuaFnGetAccountName", LuaFnGetAccountName},
                 {"LuaFnEquipTransToNew", LuaFnEquipTransToNew},
+                {"LuaFnMoveItemBagPos", LuaFnMoveItemBagPos},
                 // =============================================
             };
             
