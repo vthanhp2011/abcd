@@ -25,7 +25,7 @@
 extern "C" {
     #include "lua.h"
     #include "lauxlib.h"   // chứa lua_setfield, lua_setglobal, lua_gettop, v.v.
-    #include "lualib.h"
+//    #include "lualib.h"
 }
 
 class LuaInterface;
@@ -35,8 +35,7 @@ class LuaInterface;
 #define PAGE_ALIGN(addr) ((uintptr_t)(addr) & ~(sysconf(_SC_PAGESIZE) - 1))
 #define LOG_BUFFER_SIZE 1024
 #define MAX_HOOK_RETRY 3
-
-static size_t TRAMPOLINE_COPY_SIZE = 32;
+static size_t TRAMPOLINE_COPY_SIZE = 32; // mặc định
 
 //build
 //sudo apt update
@@ -57,7 +56,8 @@ hook_so.cpp \
    CẤU HÌNH
 ============================================================ */
 // Cấu hình runtime
-static std::atomic<bool> g_enable_log{true};
+static std::atomic<bool> g_enable_log{true}; // tắt log false
+
 static const char* LOG_PATH = "/home/tlbb/Server/Log/";
 static pthread_mutex_t g_patch_mutex = PTHREAD_MUTEX_INITIALIZER;
 // Typedef cho hàm gốc (nếu bạn hook bằng member pointer)
@@ -424,8 +424,6 @@ public:
 
 		return trampoline;
 	}
-    
-	
 	
     static void cleanup() {
         for (auto t : trampolines) {
@@ -1101,331 +1099,1450 @@ typedef int64_t (*ScriptGlobal_Format_t)(
 );
 
 static ScriptGlobal_Format_t g_orig_ScriptGlobal_Format = nullptr;
+#include <execinfo.h> // cho backtrace
+// Thêm biến global (đầu file)
+static thread_local bool g_format_already_resolved = false;
 
-// ============================================================
-// HEX DUMP DEBUG
-// ============================================================
+#include <map>
+#include <fstream>
 
-static void dump_hex(const char* tag, const void* data, size_t len)
+/*
+============================================================
+                CẤU HÌNH OFFSET (SỬA TẠI ĐÂY)
+============================================================
+Lấy offset trong IDA:
+ImageBase = 0
+LuaFnScriptGlobal_Format = 0x8CF6E0
+ScriptGlobal_Format      = 0x6B0F70
+*/
+
+static const uintptr_t OFFSET_LUA_FN   = 0x8CF6E0;
+static const uintptr_t OFFSET_FORMAT   = 0x6B0F70;
+
+/*
+============================================================
+                    ĐỊNH NGHĨA TYPE
+============================================================
+Phải đúng calling convention 64-bit (System V ABI)
+*/
+
+using LuaFnScriptGlobal_Format_t = int64_t (*)(lua_State*);
+using ScriptGlobal_Format_tttt      = int (*)(char*, int, const char*, int, ...);
+
+/*
+============================================================
+                    BIẾN TOÀN CỤC
+============================================================
+*/
+
+static LuaFnScriptGlobal_Format_t g_orig_LuaFn = nullptr;
+static ScriptGlobal_Format_tttt      g_ScriptGlobal_Formattt = nullptr;
+//static void*                      g_trampoline = nullptr;
+
+/*
+============================================================
+                    DICTIONARY
+============================================================
+*/
+
+static std::map<std::string, std::string> g_dict;
+static std::once_flag g_dict_once;
+static bool g_dict_loaded = false;
+
+static void LoadDictionary()
 {
-    if (!data || len == 0)
+    LOG("\n========== LOADING DICTIONARY ==========\n");
+    
+    Dl_info info;
+    if (dladdr((void*)LoadDictionary, &info) && info.dli_fname)
+    {
+        std::string path(info.dli_fname);
+        //LOG("[DICT] SO path: %s\n", path.c_str());
+        
+        size_t pos = path.find_last_of("/\\"); // Tìm cả / hoặc \ (dự phòng)
+        if (pos != std::string::npos)
+        {
+            // Cắt bỏ tên file .so, giữ lại đường dẫn thư mục
+            std::string dir = path.substr(0, pos + 1);
+            
+            // Thử các đường dẫn khác nhau
+            std::vector<std::string> test_paths;
+            
+            // 1. Config/StrDictionary.txt (cùng thư mục với .so)
+            test_paths.push_back(dir + "Config/StrDictionary.txt");
+            
+            // 2. ../Config/StrDictionary.txt (lên 1 cấp)
+            test_paths.push_back(dir + "../Config/StrDictionary.txt");
+            
+            // 3. ../../Config/StrDictionary.txt (lên 2 cấp)
+            test_paths.push_back(dir + "../../Config/StrDictionary.txt");
+            
+            // 4. Đường dẫn tuyệt đối (nếu biết)
+            // test_paths.push_back("/home/tlbb/Server/Config/StrDictionary.txt");
+            
+            // 5. Fallback: current directory
+            test_paths.push_back("Config/StrDictionary.txt");
+            
+            bool found = false;
+            
+            for (const auto& test_path : test_paths)
+            {
+                LOG("[DICT] Trying path: %s\n", test_path.c_str());
+                
+                std::ifstream file(test_path);
+                if (file.is_open())
+                {
+                    //LOG("[DICT] FOUND at: %s\n", test_path.c_str());
+                    
+                    std::string line;
+                    int line_num = 0;
+                    int loaded = 0;
+                    
+                    while (std::getline(file, line))
+                    {
+                        line_num++;
+                        if (line.empty()) continue;
+                        
+                        size_t tab = line.find('\t');
+                        if (tab == std::string::npos)
+                        {
+                        //    LOG("[DICT] Line %d: no tab found, skipping\n", line_num);
+                            continue;
+                        }
+                        
+                        std::string key = line.substr(0, tab);
+                        std::string value = line.substr(tab + 1);
+                        
+                        // Xóa ký tự xuống dòng cuối
+                        while (!value.empty() && (value.back() == '\r' || value.back() == '\n'))
+                            value.pop_back();
+                        
+                        g_dict[key] = value;
+                        loaded++;
+                        
+                        if (loaded <= 5) // Log 5 dòng đầu để kiểm tra
+                        {
+                            LOG("[DICT] Sample %d: key='%s' value='%s'\n", 
+                                   loaded, key.c_str(), value.c_str());
+                        }
+                    }
+                    file.close();
+                    
+                    LOG("[DICT] Loaded %d entries from StrDictionary.txt\n", loaded);
+                    LOG("[DICT] First 5 keys: ");
+                    int count = 0;
+                    for (auto& pair : g_dict)
+                    {
+                        if (count++ < 5)
+                            LOG("%s ", pair.first.c_str());
+                        else
+                            break;
+                    }
+                    LOG("\n");
+                    
+                    g_dict_loaded = true;
+                    found = true;
+                    break;
+                }
+            }
+            
+            if (!found)
+            {
+                LOG("[DICT] FAILED: Could not find StrDictionary.txt in any location\n");
+                LOG("[DICT] Searched paths:\n");
+                for (const auto& test_path : test_paths)
+                {
+                    LOG("  - %s\n", test_path.c_str());
+                }
+            }
+        }
+        else
+        {
+            LOG("[DICT] Cannot determine directory from path: %s\n", path.c_str());
+        }
+    }
+    else
+    {
+        LOG("[DICT] dladdr failed\n");
+    }
+    
+    LOG("========== DICTIONARY LOAD COMPLETE ==========\n\n");
+    fflush(stdout);
+}
+
+static const char* LookupDict(const char* key, char* out_buf, size_t buf_size)
+{
+    LOG("[DICT-LOOKUP] Looking up key: '%s'\n", key ? key : "NULL");
+    
+    if (!key)
+    {
+        LOG("[DICT-LOOKUP] Key is NULL\n");
+        return nullptr;
+    }
+    
+    std::call_once(g_dict_once, LoadDictionary);
+    
+    if (!g_dict_loaded)
+    {
+        LOG("[DICT-LOOKUP] Dictionary not loaded yet\n");
+        return nullptr;
+    }
+    
+    auto it = g_dict.find(key);
+    if (it != g_dict.end())
+    {
+        LOG("[DICT-LOOKUP] FOUND: '%s' -> '%s'\n", key, it->second.c_str());
+        strncpy(out_buf, it->second.c_str(), buf_size - 1);
+        out_buf[buf_size - 1] = '\0';
+        return out_buf;
+    }
+    
+    LOG("[DICT-LOOKUP] NOT FOUND: '%s'\n", key);
+    return nullptr;
+}
+
+/*
+============================================================
+            HÀM HOOK LuaFnScriptGlobal_Format
+============================================================
+*/
+
+/*
+============================================================
+                    HELPER MACROS
+============================================================
+*/
+#define SAFE_STR(s) ((s) && (s)[0] ? (s) : "")
+#define SAFE_LOG_STR(s) SafeLogString(s)
+
+static void SafeLogString(const char* str)
+{
+    if (!str)
+    {
+        LOG("(null)");
         return;
-
-    const unsigned char* p = (const unsigned char*)data;
-
-    LOG("---- %s (len=%zu) ----", tag, len);
-
-    char line[256];
-    int pos = 0;
-
-    for (size_t i = 0; i < len; ++i)
+    }
+    
+    size_t len = strlen(str);
+    if (len == 0)
     {
-        pos += sprintf(line + pos, "%02X ", p[i]);
-
-        if ((i + 1) % 16 == 0 || i == len - 1)
+        LOG("(empty)");
+        return;
+    }
+    
+    // Kiểm tra string có hợp lệ không
+    bool valid = true;
+    for (size_t i = 0; i < len && i < 500; i++)
+    {
+        if (str[i] == '\0')
         {
-            LOG("%s", line);
-            pos = 0;
+            valid = false;
+            break;
         }
+    }
+    
+    if (!valid)
+    {
+        LOG("(invalid string)");
+        return;
+    }
+    
+    if (len > 500)
+    {
+        LOG("%.500s... (total %zu bytes)", str, len);
+    }
+    else
+    {
+        LOG("%s", str);
     }
 }
 
-// ============================================================
-// SCRIPT GLOBAL FORMAT HOOK (FINAL STABLE VERSION)
-// ============================================================
-int64_t ScriptGlobal_Format_Hook(
-    char* dest,
-    int len,
-    const char* key,
-    ...)
+extern "C"
+int64_t LuaFnScriptGlobal_Format_Hook(lua_State* L)
 {
-    if (!dest || !key || len <= 0)
+    LOG("=================================================================================");
+    LOG("LuaFnScriptGlobal_Format_Hook CALLED");
+    LOG("=================================================================================");
+
+    if (!L)
+    {
+        LOG("ERROR: lua_State is NULL");
         return 0;
+    }
 
-    va_list ap;
-    va_start(ap, key);
+    int top = lua_gettop(L);
+    LOG("Lua stack top = %d", top);
 
-    const char* arg0 = va_arg(ap, const char*);
-    va_end(ap);
+    if (top < 1)
+    {
+        LOG("ERROR: Stack too small (<1)");
+        lua_pushstring(L, "");
+        return 1;
+    }
 
-    LOG("key=%s arg0=%s", key, arg0 ? arg0 : "(null)");
+    int paramCount = top - 1;
+    const char* key = lua_tostring(L, 1);
 
-    const char* format = GetTextByKey(key);
-    if (!format)
-        return 0;
+    LOG("Original format key = '%s'", key ? key : "NULL");
+    LOG("Original format key length = %zu", key ? strlen(key) : 0);
+    LOG("Number of additional params = %d", paramCount);
 
-    std::string fmt = format;
+    // Log tất cả các tham số gốc từ Lua
+    LOG("----- Original Lua arguments -----");
+    for (int i = 1; i <= top; i++)
+    {
+        int type = lua_type(L, i);
+        const char* typeName = "unknown";
+        switch (type)
+        {
+            case LUA_TNIL: typeName = "nil"; break;
+            case LUA_TBOOLEAN: typeName = "boolean"; break;
+            case LUA_TNUMBER: typeName = "number"; break;
+            case LUA_TSTRING: typeName = "string"; break;
+            default: typeName = "other"; break;
+        }
+        
+        if (type == LUA_TNUMBER)
+        {
+            double num = lua_tonumber(L, i);
+            LOG("  Arg[%d]: type=%s, value=%f", i, typeName, num);
+        }
+        else if (type == LUA_TSTRING)
+        {
+            const char* val = lua_tostring(L, i);
+            LOG("  Arg[%d]: type=%s, value='%s'", i, typeName, val ? val : "NULL");
+        }
+        else
+        {
+            LOG("  Arg[%d]: type=%s", i, typeName);
+        }
+    }
 
-    size_t pos = fmt.find("%s0");
-    if (pos != std::string::npos)
-        fmt.replace(pos, 3, "%s");
+    if (!key)
+    {
+        LOG("ERROR: Key is NULL, pushing empty string");
+        lua_pushstring(L, "");
+        return 1;
+    }
 
-    char buffer[1024];
-    snprintf(buffer, sizeof(buffer), fmt.c_str(), arg0 ? arg0 : "");
+    if (paramCount < 0)
+    {
+        LOG("ERROR: paramCount < 0");
+        lua_pushstring(L, key);
+        return 1;
+    }
 
-    strncpy(dest, buffer, len - 1);
-    dest[len - 1] = 0;
+    if (paramCount > 9)
+    {
+        LOG("ERROR: Too many params (%d > 9)", paramCount);
+        lua_pushstring(L, "LUA: too many parameters!");
+        return 1;
+    }
 
-    LOG("FINAL TEXT: %s", dest);
+    // Buffer lớn cho xử lý
+    char resolved_format[32768] = {0};
+    char resolved_args[9][32768] = {{0}};
+    const char* final_args[9] = {nullptr};
 
+    LOG("----- STEP 1: Resolve format key from dictionary -----");
+    
+    // Xử lý format key nếu nó là dạng #{key}
+    const char* actual_format = key;
+    bool is_resolved_format = false;
+    
+    if (key[0] == '#' && key[1] == '{')
+    {
+        size_t len = strlen(key);
+        if (len > 3 && key[len - 1] == '}')
+        {
+            char dict_key[256] = {0};
+            strncpy(dict_key, key + 2, len - 3);
+            dict_key[len - 3] = '\0';
+            
+            LOG("Format key is #{...} pattern, extracting key: '%s'", dict_key);
+            
+            char dict_value[32768] = {0};
+            const char* resolved = LookupDict(dict_key, dict_value, sizeof(dict_value));
+            
+            if (resolved)
+            {
+                LOG("Resolved format key length: %zu bytes", strlen(resolved));
+                strncpy(resolved_format, resolved, sizeof(resolved_format) - 1);
+                resolved_format[sizeof(resolved_format) - 1] = '\0';
+                actual_format = resolved_format;
+                is_resolved_format = true;
+            }
+            else
+            {
+                LOG("Key not found in dictionary, keeping original format");
+                actual_format = key;
+            }
+        }
+    }
+
+    LOG("----- STEP 2: Resolve parameters from dictionary -----");
+    
+    auto IsSpecialMacro = [](const char* macro_content) -> bool {
+        if (!macro_content) return false;
+        
+        const char* special_prefixes[] = {
+            "_INFOAIM", "_ITEM", "_NPC", "_MAP", "_ZONE", 
+            "_SKILL", "_BUFF", "_QUEST", "_DIALOG", "_SHOP"
+        };
+        
+        for (const char* prefix : special_prefixes)
+        {
+            if (strncmp(macro_content, prefix, strlen(prefix)) == 0)
+                return true;
+        }
+        
+        return (strchr(macro_content, ',') != nullptr);
+    };
+
+    // Xử lý từng tham số
+    for (int i = 2; i <= paramCount + 1; ++i)
+    {
+        int idx = i - 2;
+        int type = lua_type(L, i);
+        const char* s = nullptr;
+        char num_buf[64] = {0};
+        
+        LOG("Processing param[%d] (Lua index %d, type=%d)", idx, i, type);
+        
+        if (type == LUA_TNUMBER)
+        {
+            double num = lua_tonumber(L, i);
+            snprintf(num_buf, sizeof(num_buf), "%g", num);
+            s = num_buf;
+            LOG("  Number value: %f -> '%s'", num, s);
+        }
+        else if (type == LUA_TSTRING)
+        {
+            s = lua_tostring(L, i);
+            LOG("  String value: '%s'", s ? s : "NULL");
+        }
+        else if (type == LUA_TBOOLEAN)
+        {
+            s = lua_toboolean(L, i) ? "true" : "false";
+            LOG("  Boolean value: '%s'", s);
+        }
+        else
+        {
+            s = "";
+            LOG("  Using empty string for type %d", type);
+        }
+        
+        if (!s) s = "";
+        
+        // Copy vào buffer an toàn
+        strncpy(resolved_args[idx], s, sizeof(resolved_args[idx]) - 1);
+        resolved_args[idx][sizeof(resolved_args[idx]) - 1] = '\0';
+        final_args[idx] = resolved_args[idx];
+    }
+
+    LOG("----- STEP 3: Replace %%s placeholders in resolved format -----");
+
+    char final_buffer[65536] = {0};
+    char temp_buffer[131072] = {0};
+
+    // Copy format đã resolve vào buffer
+    strncpy(final_buffer, actual_format, sizeof(final_buffer) - 1);
+    final_buffer[sizeof(final_buffer) - 1] = '\0';
+    
+    size_t fmt_len = strlen(final_buffer);
+    LOG("Format after dictionary resolution: length=%zu", fmt_len);
+
+    // Đếm số lượng placeholder cần xử lý
+    int max_placeholder = -1;
+    for (int i = 0; i < paramCount; i++)
+    {
+        char placeholder[16];
+        snprintf(placeholder, sizeof(placeholder), "%%s%d", i);
+        if (strstr(final_buffer, placeholder))
+        {
+            max_placeholder = i;
+            LOG("Found placeholder %s", placeholder);
+        }
+    }
+    
+    LOG("Max placeholder found: %s%d", max_placeholder >= 0 ? "%s" : "none", max_placeholder);
+    
+    // CẢNH BÁO nếu số lượng placeholder không khớp
+    if (max_placeholder + 1 > paramCount)
+    {
+        LOG("WARNING: Format needs %d params but only %d provided!", max_placeholder + 1, paramCount);
+    }
+
+    // Xử lý từng %s placeholder
+    for (int i = 0; i < paramCount; i++)
+    {
+        char placeholder[16];
+        snprintf(placeholder, sizeof(placeholder), "%%s%d", i);
+        
+        // Tìm và thay thế TẤT CẢ occurrences
+        char* pos;
+        int replaced = 0;
+        while ((pos = strstr(final_buffer, placeholder)) != nullptr)
+        {
+            LOG("Replacing %s with '%s'", placeholder, final_args[i]);
+            
+            size_t before_len = pos - final_buffer;
+            size_t placeholder_len = strlen(placeholder);
+            size_t replace_len = strlen(final_args[i]);
+            
+            // Tạo buffer mới
+            char new_buffer[65536] = {0};
+            
+            // Copy phần trước
+            strncpy(new_buffer, final_buffer, before_len);
+            new_buffer[before_len] = '\0';
+            
+            // Thêm text thay thế
+            strcat(new_buffer, final_args[i]);
+            
+            // Thêm phần sau
+            strcat(new_buffer, pos + placeholder_len);
+            
+            // Copy lại
+            strncpy(final_buffer, new_buffer, sizeof(final_buffer) - 1);
+            final_buffer[sizeof(final_buffer) - 1] = '\0';
+            
+            replaced++;
+        }
+        
+        if (replaced > 0)
+        {
+            LOG("Replaced %d occurrence(s) of %s", replaced, placeholder);
+        }
+    }
+
+    size_t final_len = strlen(final_buffer);
+    LOG("----- Final string length: %zu bytes -----", final_len);
+
+    // Kiểm tra xem còn placeholder nào không
+    if (strstr(final_buffer, "%s"))
+    {
+        LOG("WARNING: Still has %%s placeholders after replacement!");
+        
+        // Log chi tiết các placeholder còn lại
+        for (int i = 0; i < paramCount; i++)
+        {
+            char placeholder[16];
+            snprintf(placeholder, sizeof(placeholder), "%%s%d", i);
+            if (strstr(final_buffer, placeholder))
+            {
+                LOG("  Remaining: %s", placeholder);
+            }
+        }
+    }
+
+    // ============================================================
+    // GỌI SCRIPTGLOBAL_FORMAT GỐC
+    // ============================================================
+    LOG("----- Lua Hook: Đã xử lý xong, đánh dấu flag -----");
+    g_format_already_resolved = true;
+
+    char dest[320] = {0};
+    int ok = 0;
+
+    if (!g_ScriptGlobal_Formattt)
+    {
+        LOG("ERROR: g_ScriptGlobal_Formattt is NULL!");
+        g_format_already_resolved = false;
+        lua_pushstring(L, final_buffer); // Fallback
+        return 1;
+    }
+
+    LOG("----- Calling original ScriptGlobal_Format -----");
+    LOG("  final_buffer length=%zu, count=%d", final_len, paramCount);
+
+    if (final_len >= sizeof(dest))
+    {
+        LOG("  WARNING: Buffer too large (%zu >= %zu), will be truncated!", 
+            final_len, sizeof(dest));
+    }
+
+    // QUAN TRỌNG: Gọi ScriptGlobal_Format với count=0 vì đã xử lý xong placeholder
+    ok = g_ScriptGlobal_Formattt(dest, sizeof(dest), final_buffer, 0);
+    
+    LOG("  ScriptGlobal_Format returned: %d", ok);
+    g_format_already_resolved = false;
+
+    if (!ok)
+    {
+        LOG("ERROR: Format failed, using final_buffer as fallback");
+        lua_pushstring(L, final_buffer);
+        return 1;
+    }
+
+    // Log kết quả để debug
+    size_t dest_len = strlen(dest);
+    LOG("Result length: %zu bytes", dest_len);
+    if (dest_len < 500)
+    {
+        LOG("Result content: %s", dest);
+    }
+
+    lua_pushstring(L, dest);
+    LOG("Pushed result to Lua stack");
+    LOG("=================================================================================");
+    
     return 1;
 }
 
 
-//lúc nãy key đã được ghi vào cuối chuỗi, giờ bạn chỉ cần thay key vào %s0 %s1 %s2 %s3 .... ScriptGlobal_Format("TalentMP_20210804_12",key1, key2,key3,key4....)  hàm lúc nãy của bạn: 
-
-int ScriptGlobal_Format_Hook_xx(
-    char* dest,
-    int   dest_len,
-    const char* fmt,
-    int   count,
-    const char** args)
+extern "C"
+int64_t LuaFnScriptGlobal_Format_Hook_old(lua_State* L)
 {
-    LOG("===== ScriptGlobal_Format ENTER =====");
 
-    if (!dest || !fmt)
+    LOG("=================================================================================");
+    LOG("LuaFnScriptGlobal_Format_Hook CALLED");
+    LOG("=================================================================================");
+
+    if (!L)
     {
-        LOG("Invalid param -> call original");
-        return g_orig_ScriptGlobal_Format(dest, dest_len, fmt, count, args);
+        LOG("ERROR: lua_State is NULL");
+        return 0;
     }
 
-    LOG("dest=%p len=%d fmt=%s count=%d",
-        dest, dest_len, fmt, count);
+    int top = lua_gettop(L);
+    LOG("Lua stack top = %d", top);
 
-    // -------------------------------------------------
-    // Nếu không có %sX thì dùng hàm gốc
-    // -------------------------------------------------
-
-    if (!strstr(fmt, "%s"))
+    if (top < 1)
     {
-        LOG("No placeholder -> fallback original");
-        return g_orig_ScriptGlobal_Format(dest, dest_len, fmt, count, args);
+        LOG("ERROR: Stack too small (<1)");
+        lua_pushstring(L, "");
+        return 1;
     }
 
-    // -------------------------------------------------
-    // Copy format gốc vào buffer tạm
-    // -------------------------------------------------
+    int paramCount = top - 1;
+    const char* key = lua_tostring(L, 1);
 
-    char buffer[4096];
-    memset(buffer, 0, sizeof(buffer));
-    strncpy(buffer, fmt, sizeof(buffer) - 1);
+    LOG("Original format key = '%s'", key ? key : "NULL");
+    LOG("Original format key length = %zu", key ? strlen(key) : 0);
+    LOG("Number of additional params = %d", paramCount);
 
-    // -------------------------------------------------
-    // Replace %s0 %s1 %s2 ...
-    // -------------------------------------------------
-
-    for (int i = 0; i < count; i++)
+    // Log tất cả các tham số gốc từ Lua
+    LOG("----- Original Lua arguments -----");
+    for (int i = 1; i <= top; i++)
     {
-        if (!args[i])
+        int type = lua_type(L, i);
+        const char* typeName = "unknown";
+        switch (type)
+        {
+            case LUA_TNIL: typeName = "nil"; break;
+            case LUA_TBOOLEAN: typeName = "boolean"; break;
+            case LUA_TLIGHTUSERDATA: typeName = "lightuserdata"; break;
+            case LUA_TNUMBER: typeName = "number"; break;
+            case LUA_TSTRING: typeName = "string"; break;
+            case LUA_TTABLE: typeName = "table"; break;
+            case LUA_TFUNCTION: typeName = "function"; break;
+            case LUA_TUSERDATA: typeName = "userdata"; break;
+            case LUA_TTHREAD: typeName = "thread"; break;
+        }
+        
+        if (type == LUA_TSTRING)
+        {
+            const char* val = lua_tostring(L, i);
+            size_t val_len = val ? strlen(val) : 0;
+            LOG("  Arg[%d]: type=%s, length=%zu", i, typeName, val_len);
+            if (val_len > 0)
+            {
+                if (val_len > 200)
+                {
+                    LOG("    First 200 chars: %.200s...", val);
+                }
+                else
+                {
+                    LOG("    Value: '%s'", val);
+                }
+            }
+        }
+        else
+        {
+            LOG("  Arg[%d]: type=%s", i, typeName);
+        }
+    }
+
+    if (!key)
+    {
+        LOG("ERROR: Key is NULL, pushing empty string");
+        lua_pushstring(L, "");
+        return 1;
+    }
+
+    if (paramCount < 0)
+    {
+        LOG("ERROR: paramCount < 0");
+        lua_pushstring(L, key);
+        return 1;
+    }
+
+    if (paramCount > 9)
+    {
+        LOG("ERROR: Too many params (%d > 9)", paramCount);
+        lua_pushstring(L, "LUA: too many parameters!");
+        return 1;
+    }
+
+    // Buffer lớn cho xử lý (32KB)
+    char resolved_format[32768] = {0};
+    char resolved_args[9][32768] = {{0}};
+    const char* final_args[9] = {nullptr};
+
+    LOG("----- STEP 1: Resolve format key from dictionary -----");
+    
+    // Xử lý format key nếu nó là dạng #{key}
+    const char* actual_format = key;
+    
+    if (key[0] == '#' && key[1] == '{')
+    {
+        size_t len = strlen(key);
+        if (len > 3 && key[len - 1] == '}')
+        {
+            char dict_key[256] = {0};
+            strncpy(dict_key, key + 2, len - 3);
+            dict_key[len - 3] = '\0';
+            
+            LOG("Format key is #{...} pattern, extracting key: '%s'", dict_key);
+            
+            char dict_value[32768] = {0};
+            const char* resolved = LookupDict(dict_key, dict_value, sizeof(dict_value));
+            
+            if (resolved)
+            {
+                LOG("Resolved format key: ->");
+                LOG("  Length: %zu bytes", strlen(resolved));
+                if (strlen(resolved) > 200)
+                {
+                    LOG("  First 200: %.200s...", resolved);
+                }
+                else
+                {
+                    LOG("  Value: '%s'", resolved);
+                }
+                strncpy(resolved_format, resolved, sizeof(resolved_format) - 1);
+                actual_format = resolved_format;
+            }
+            else
+            {
+                LOG("Key not found in dictionary, keeping original format");
+                actual_format = key;
+            }
+        }
+        else
+        {
+            LOG("Malformed #{...} pattern, keeping original");
+            actual_format = key;
+        }
+    }
+    else
+    {
+        LOG("Format key is not #{...} pattern, keeping original");
+        actual_format = key;
+    }
+
+    LOG("----- STEP 2: Resolve parameters from dictionary -----");
+    
+    auto IsSpecialMacro = [](const char* macro_content) -> bool {
+        if (!macro_content) return false;
+        
+        const char* special_prefixes[] = {
+            "_INFOAIM", "_ITEM", "_NPC", "_MAP", "_ZONE", 
+            "_SKILL", "_BUFF", "_QUEST", "_DIALOG", "_SHOP",
+            "_INFO", "_AIM"
+        };
+        
+        for (const char* prefix : special_prefixes)
+        {
+            if (strncmp(macro_content, prefix, strlen(prefix)) == 0)
+            {
+                return true;
+            }
+        }
+        
+        if (strchr(macro_content, ','))
+        {
+            return true;
+        }
+        
+        return false;
+    };
+
+    // Xử lý từng tham số
+    for (int i = 2; i <= paramCount + 1; ++i)
+    {
+        int idx = i - 2;
+        const char* s = lua_tostring(L, i);
+        
+        LOG("Processing param[%d] (Lua index %d):", idx, i);
+        
+        if (!s)
+        {
+            LOG("  -> param[%d] is NULL, using empty string", idx);
+            final_args[idx] = "";
             continue;
+        }
 
-        char tag[16];
-        snprintf(tag, sizeof(tag), "%%s%d", i);
+        size_t s_len = strlen(s);
+        LOG("  Original length: %zu bytes", s_len);
+        
+        if (s_len > 200)
+        {
+            LOG("  First 200 chars: %.200s...", s);
+        }
+        else
+        {
+            LOG("  Original text: '%s'", s);
+        }
 
-        char* pos = strstr(buffer, tag);
+        // Copy vào buffer tạm để xử lý
+        char temp[32768] = {0};
+        strncpy(temp, s, sizeof(temp) - 1);
+        
+        // XỬ LÝ MACRO TRONG THAM SỐ
+        bool has_macro = false;
+        char processed[32768] = {0};
+        char* current_pos = temp;
+        char* out_pos = processed;
+        
+        LOG("  Scanning for macros and color codes...");
+        
+        int macro_count = 0;
+        int color_count = 0;
+        
+        while (*current_pos)
+        {
+            if (current_pos[0] == '#' && current_pos[1] == '{')
+            {
+                // Tìm kết thúc macro
+                char* end_macro = strchr(current_pos + 2, '}');
+                if (end_macro)
+                {
+                    macro_count++;
+                    has_macro = true;
+                    
+                    // Trích nội dung macro
+                    char macro_content[4096] = {0};
+                    size_t content_len = end_macro - (current_pos + 2);
+                    strncpy(macro_content, current_pos + 2, content_len);
+                    macro_content[content_len] = '\0';
+                    
+                    LOG("  Found macro #%d: #{%.*s}", 
+                        macro_count, (int)content_len, current_pos + 2);
+                    
+                    // Kiểm tra macro đặc biệt
+                    if (IsSpecialMacro(macro_content))
+                    {
+                        LOG("    Keeping special macro as is");
+                        // Copy nguyên macro
+                        size_t macro_len = end_macro - current_pos + 1;
+                        strncpy(out_pos, current_pos, macro_len);
+                        out_pos += macro_len;
+                    }
+                    else
+                    {
+                        // Tra dictionary
+                        char dict_buf[32768] = {0};
+                        LOG("    Looking up in dictionary: '%s'", macro_content);
+                        
+                        const char* resolved = LookupDict(macro_content, dict_buf, sizeof(dict_buf));
+                        if (resolved)
+                        {
+                            size_t resolved_len = strlen(resolved);
+                            LOG("    RESOLVED: -> text length %zu", resolved_len);
+                            if (resolved_len > 200)
+                            {
+                                LOG("      First 200: %.200s...", resolved);
+                            }
+                            else
+                            {
+                                LOG("      Text: '%s'", resolved);
+                            }
+                            // Copy nội dung đã resolve
+                            strcpy(out_pos, resolved);
+                            out_pos += resolved_len;
+                        }
+                        else
+                        {
+                            LOG("    NOT FOUND in dictionary, keeping original macro");
+                            // Copy nguyên macro
+                            size_t macro_len = end_macro - current_pos + 1;
+                            strncpy(out_pos, current_pos, macro_len);
+                            out_pos += macro_len;
+                        }
+                    }
+                    
+                    current_pos = end_macro + 1;
+                }
+                else
+                {
+                    *out_pos++ = *current_pos++;
+                }
+            }
+            else if (current_pos[0] == '#' && 
+                     (current_pos[1] == 'R' || current_pos[1] == 'G' || 
+                      current_pos[1] == 'Y' || current_pos[1] == 'W' || 
+                      current_pos[1] == 'r' || current_pos[1] == 'b' ||
+                      current_pos[1] == 'c' || current_pos[1] == 'm'))
+            {
+                // Mã màu
+                color_count++;
+                *out_pos++ = *current_pos++;
+                *out_pos++ = *current_pos++;
+            }
+            else
+            {
+                *out_pos++ = *current_pos++;
+            }
+        }
+        *out_pos = '\0';
+        
+        size_t processed_len = strlen(processed);
+        LOG("  Processing complete:");
+        LOG("    Macros found: %d", macro_count);
+        LOG("    Color codes: %d", color_count);
+        LOG("    Final length: %zu bytes", processed_len);
+        
+        if (has_macro)
+        {
+            if (processed_len > 200)
+            {
+                LOG("  After processing (first 200): %.200s...", processed);
+            }
+            else
+            {
+                LOG("  After processing: '%s'", processed);
+            }
+            strncpy(resolved_args[idx], processed, sizeof(resolved_args[idx]) - 1);
+            final_args[idx] = resolved_args[idx];
+        }
+        else
+        {
+            LOG("  No macros found, keeping original");
+            final_args[idx] = s;
+        }
+    }
+
+    LOG("----- STEP 3: Replace %s placeholders in resolved format -----");
+
+    char final_buffer[65536] = {0};
+    char temp_buffer[131072] = {0}; // Buffer tạm lớn hơn
+
+    // Copy format đã resolve vào buffer
+    strncpy(final_buffer, actual_format, sizeof(final_buffer) - 1);
+    LOG("Format after dictionary resolution:");
+    LOG("  Length: %zu bytes", strlen(final_buffer));
+    if (strlen(final_buffer) > 200)
+    {
+        LOG("  First 200: %.200s...", final_buffer);
+        // Tìm vị trí của %s0 nếu có
+        char* pos = strstr(final_buffer, "%s0");
+        if (pos)
+        {
+            LOG("  Found %%s0 at position %ld", pos - final_buffer);
+        }
+    }
+    else
+    {
+        LOG("  Content: '%s'", final_buffer);
+    }
+
+    // Kiểm tra xem có placeholder %s nào không
+    bool has_placeholder = (strstr(final_buffer, "%s") != nullptr);
+    LOG("Format has %%s placeholders: %s", has_placeholder ? "YES" : "NO");
+
+    if (!has_placeholder)
+    {
+        LOG("WARNING: Format has no %%s placeholders but we have %d parameters!", paramCount);
+    }
+
+// Xử lý từng %s placeholder
+for (int i = 0; i < paramCount; i++)
+{
+    char placeholder[16];
+    snprintf(placeholder, sizeof(placeholder), "%%s%d", i);
+    
+    LOG("Looking for placeholder: %s", placeholder);
+    
+    // Tìm tất cả occurrences của placeholder này
+    int found_count = 0;
+    char* search_pos = final_buffer;
+    
+    while (true)
+    {
+        char* pos = strstr(search_pos, placeholder);
         if (!pos)
+            break;
+        
+        found_count++;
+        LOG("  Found %s at position %ld (occurrence #%d)", 
+            placeholder, pos - final_buffer, found_count);
+        
+        // Lấy giá trị thay thế - AN TOÀN
+        const char* replace_text = "";
+        
+        // Kiểm tra an toàn
+        if (i < paramCount && final_args[i] != nullptr)
         {
-            LOG("Placeholder %s not found", tag);
-            continue;
+            replace_text = final_args[i];
+            if (strlen(replace_text) == 0)
+            {
+                LOG("  Arg[%d] is empty string, using empty string", i);
+                replace_text = "";
+            }
+            else
+            {
+                size_t replace_len = strlen(replace_text);
+                LOG("  Replacing %s with text of length %zu", placeholder, replace_len);
+            }
         }
-
-        LOG("Replacing %s -> %s", tag, args[i]);
-
-        char temp[4096];
-        size_t before = pos - buffer;
-
-        snprintf(temp, sizeof(temp), "%.*s%s%s",
-                 (int)before,
-                 buffer,
-                 args[i],
-                 pos + strlen(tag));
-
-        strncpy(buffer, temp, sizeof(buffer) - 1);
+        else
+        {
+            LOG("  Arg[%d] is missing or out of range, using empty string", i);
+            replace_text = "";
+        }
+        
+        // Tính toán các độ dài
+        size_t before_len = pos - final_buffer;
+        size_t placeholder_len = strlen(placeholder);
+        size_t replace_len = strlen(replace_text);
+        size_t after_len = strlen(pos + placeholder_len);
+        
+        // Kiểm tra overflow
+        if (before_len + replace_len + after_len >= sizeof(temp_buffer))
+        {
+            LOG("    ERROR: Buffer overflow would occur, skipping replacement");
+            LOG("    Required: %zu, Max: %zu", before_len + replace_len + after_len, sizeof(temp_buffer));
+            break;
+        }
+        
+        // Copy phần trước placeholder
+        strncpy(temp_buffer, final_buffer, before_len);
+        temp_buffer[before_len] = '\0';
+        
+        // Thêm text thay thế
+        strncat(temp_buffer, replace_text, sizeof(temp_buffer) - strlen(temp_buffer) - 1);
+        
+        // Thêm phần sau placeholder
+        strncat(temp_buffer, pos + placeholder_len, 
+                sizeof(temp_buffer) - strlen(temp_buffer) - 1);
+        
+        // Copy back vào final_buffer
+        strncpy(final_buffer, temp_buffer, sizeof(final_buffer) - 1);
+        final_buffer[sizeof(final_buffer) - 1] = '\0';
+        
+        LOG("    After replacement (buffer now %zu bytes)", strlen(final_buffer));
+        
+        // Tiếp tục tìm kiếm từ vị trí mới
+        search_pos = final_buffer + before_len + replace_len;
     }
-
-    // -------------------------------------------------
-    // Copy kết quả vào dest
-    // -------------------------------------------------
-
-    size_t final_len = strlen(buffer);
-
-    if (final_len >= (size_t)dest_len)
+    
+    if (found_count == 0)
     {
-        LOG("Overflow detected -> fallback original");
-        return g_orig_ScriptGlobal_Format(dest, dest_len, fmt, count, args);
+        LOG("  Placeholder %s not found in current buffer", placeholder);
     }
-
-    memset(dest, 0, dest_len);
-    memcpy(dest, buffer, final_len);
-
-    LOG("FINAL STRING: %s", dest);
-
-    // -------------------------------------------------
-    // HEXDUMP
-    // -------------------------------------------------
-
-    LOG("---- FINAL HEX (len=%zu) ----", final_len);
-
-    for (size_t i = 0; i < final_len; i++)
+    else
     {
-        printf("%02X ", (unsigned char)dest[i]);
-        if ((i + 1) % 16 == 0)
-            printf("\n");
+        LOG("  Replaced %d occurrence(s) of %s", found_count, placeholder);
     }
-    printf("\n");
+}
 
-    LOG("===== ScriptGlobal_Format EXIT =====");
+    size_t final_len = strlen(final_buffer);
+    LOG("----- Final string after all processing -----");
+    LOG("  Total length: %zu bytes", final_len);
+    
+    if (final_len > 0)
+    {
+        if (final_len > 500)
+        {
+            LOG("  First 500 chars: %.500s...", final_buffer);
+            LOG("  Last 500 chars: ...%s", final_buffer + final_len - 500);
+        }
+        else
+        {
+            LOG("  Full text: %s", final_buffer);
+        }
+    }
 
+    // Kiểm tra xem còn placeholder nào không
+    if (strstr(final_buffer, "%s"))
+    {
+        LOG("WARNING: Still has %%s placeholders after replacement!");
+    }
+
+    // ============================================================
+    // GỌI SCRIPTGLOBAL_FORMAT GỐC
+    // ============================================================
+	LOG("----- Lua Hook: Đã xử lý xong, đánh dấu flag -----");
+	g_format_already_resolved = true;
+
+	char dest[320] = {0};
+	int ok = 0;
+
+	if (!g_ScriptGlobal_Formattt)
+	{
+		LOG("ERROR: g_ScriptGlobal_Formattt is NULL!");
+		g_format_already_resolved = false; // Reset flag trước khi return
+		lua_pushstring(L, "Format function NULL!");
+		return 1;
+	}
+
+	LOG("----- Calling original ScriptGlobal_Format -----");
+	LOG("  dest=%p, dest_len=%d", dest, (int)sizeof(dest));
+	LOG("  final_buffer length=%zu", final_len);
+	LOG("  count=%d", paramCount);
+	LOG("  flag is set, ScriptGlobal_Format will copy directly");
+
+    // CẢNH BÁO: Nếu final_buffer quá dài, có thể bị cắt bớt
+    if (final_len >= sizeof(dest))
+    {
+        LOG("  WARNING: final_buffer (%zu) > dest buffer (%zu), will be truncated!", 
+            final_len, sizeof(dest));
+    }
+
+    // Gọi ScriptGlobal_Format gốc với final_buffer đã xử lý hoàn chỉnh
+    // LƯU Ý: Không truyền args vì đã xử lý xong hết placeholder
+    switch (paramCount)
+    {
+        case 0:
+            ok = g_ScriptGlobal_Formattt(dest, sizeof(dest), final_buffer, 0);
+            break;
+        case 1:
+            // Vẫn truyền args nhưng có thể không cần
+            ok = g_ScriptGlobal_Formattt(dest, sizeof(dest), final_buffer, 1, final_args[0]);
+            break;
+        case 2:
+            ok = g_ScriptGlobal_Formattt(dest, sizeof(dest), final_buffer, 2,
+                                       final_args[0], final_args[1]);
+            break;
+        case 3:
+            ok = g_ScriptGlobal_Formattt(dest, sizeof(dest), final_buffer, 3,
+                                       final_args[0], final_args[1], final_args[2]);
+            break;
+        case 4:
+            ok = g_ScriptGlobal_Formattt(dest, sizeof(dest), final_buffer, 4,
+                                       final_args[0], final_args[1], final_args[2], final_args[3]);
+            break;
+        case 5:
+            ok = g_ScriptGlobal_Formattt(dest, sizeof(dest), final_buffer, 5,
+                                       final_args[0], final_args[1], final_args[2], 
+                                       final_args[3], final_args[4]);
+            break;
+        case 6:
+            ok = g_ScriptGlobal_Formattt(dest, sizeof(dest), final_buffer, 6,
+                                       final_args[0], final_args[1], final_args[2], 
+                                       final_args[3], final_args[4], final_args[5]);
+            break;
+        case 7:
+            ok = g_ScriptGlobal_Formattt(dest, sizeof(dest), final_buffer, 7,
+                                       final_args[0], final_args[1], final_args[2], 
+                                       final_args[3], final_args[4], final_args[5],
+                                       final_args[6]);
+            break;
+        case 8:
+            ok = g_ScriptGlobal_Formattt(dest, sizeof(dest), final_buffer, 8,
+                                       final_args[0], final_args[1], final_args[2], 
+                                       final_args[3], final_args[4], final_args[5],
+                                       final_args[6], final_args[7]);
+            break;
+        case 9:
+            ok = g_ScriptGlobal_Formattt(dest, sizeof(dest), final_buffer, 9,
+                                       final_args[0], final_args[1], final_args[2], 
+                                       final_args[3], final_args[4], final_args[5],
+                                       final_args[6], final_args[7], final_args[8]);
+            break;
+        default:
+            LOG("ERROR: Unsupported paramCount %d", paramCount);
+            ok = 0;
+            break;
+    }
+	LOG("  ScriptGlobal_Format returned: %d", ok);
+
+	// Reset flag SAU KHI gọi xong
+	g_format_already_resolved = false;
+
+
+    if (!ok)
+    {
+        LOG("ERROR: Format failed");
+        char err[256];
+        snprintf(err, sizeof(err),
+                 "Format fail! Key=%s Param=%d",
+                 key, paramCount);
+
+        lua_pushstring(L, err);
+        LOG("=================================================================================");
+        return 1;
+    }
+
+    size_t dest_len = strlen(dest);
+    LOG("----- Result buffer -----");
+    LOG("  Length: %zu bytes", dest_len);
+    
+    if (dest_len > 0)
+    {
+        if (dest_len > 500)
+        {
+            LOG("  First 500 chars: %.500s...", dest);
+        }
+        else
+        {
+            LOG("  Content: '%s'", dest);
+        }
+    }
+
+	
+    lua_pushstring(L, dest);
+    LOG("Pushed result to Lua stack");
+    LOG("=================================================================================");
+    
     return 1;
 }
 
-
-
-int64_t ScriptGlobal_Format_Hook_bak(
+int64_t ScriptGlobal_Format_Hook(
         char *dest,
         int a2,
         const char *a3,
         int a4,
         ...)
 {
-    LOG("===== ScriptGlobal_Format ENTER =====");
-    LOG("dest=%p len=%d fmt=%s count=%d",
-             dest, a2, a3 ? a3 : "(null)", a4);
+    LOG("==================================================");
+    LOG("ScriptGlobal_Format_Hook ENTER");
+    LOG("==================================================");
+    
+    LOG("Parameters:");
+    LOG("  dest     = %p", dest);
+    LOG("  dest_len = %d", a2);
+    LOG("  format   = '%s'", SAFE_STR(a3));
+    LOG("  count    = %d", a4);
+    LOG("  format_already_resolved = %s", g_format_already_resolved ? "YES" : "NO");
 
+    // VALIDATE INPUT
     if (!dest || a2 <= 0)
     {
-        LOG("Invalid dest buffer");
+        LOG("ERROR: Invalid dest buffer");
+        return 0;
+    }
+    
+    if (!a3)
+    {
+        LOG("ERROR: format is NULL");
+        if (dest && a2 > 0)
+        {
+            memset(dest, 0, a2);
+        }
         return 0;
     }
 
+    // Nếu format đã được resolve, copy trực tiếp và BỎ QUA tham số
+    if (g_format_already_resolved)
+    {
+        LOG("✓ Format already resolved, copying directly (ignoring %d parameters)", a4);
+        size_t len = strlen(a3);
+        if (len < (size_t)a2)
+        {
+            strcpy(dest, a3);
+            LOG("  Direct copy successful: %zu bytes", len);
+            LOG("  Content: %s", dest);
+            return 1;
+        }
+        else
+        {
+            LOG("ERROR: Buffer too small for direct copy");
+            LOG("  Need: %zu, Have: %d", len, a2);
+            return 0;
+        }
+    }
+
+    // CHỈ đến đây mới xử lý đóng gói tham số
+    LOG("Format needs packaging with %d parameters", a4);
+    
     va_list va;
     va_start(va, a4);
-
-    memset(dest, 0, a2);
-
-    if (!a3)
+    
+    // Clear destination
+    if (dest && a2 > 0)
     {
-        LOG("fmt NULL");
+        memset(dest, 0, a2);
+    }
+
+    size_t fmt_len = strlen(a3);
+    size_t v15 = fmt_len + 1;
+    int v16 = (int)v15 - 1;
+
+    if (a2 <= (int)v15 - 1)
+    {
+        LOG("ERROR: Buffer too small for format");
+        LOG("  Buffer size: %d, Need: %d", a2, (int)v15 - 1);
         va_end(va);
         return 0;
     }
 
-    size_t v15 = strlen(a3) + 1;
-    int v16 = (int)v15 - 1;
-    int64_t result = 0;
+    // Copy format string
+    LOG("Copying format string (%d bytes)", (int)v15 - 2);
+    memcpy(dest, a3, (int)v15 - 2);
 
-    if (a2 > (int)v15 - 1)
+    if (a4 <= 0)
     {
-        memcpy(dest, a3, (int)v15 - 2);
+        LOG("No parameters, adding closing '}'");
+        dest[v16 - 1] = 125; // '}'
+        va_end(va);
+        return 1;
+    }
 
-        if (a4 <= 0)
+    LOG("Adding parameter marker '*' at position %d", v16 - 1);
+    dest[v16 - 1] = 42; // '*'
+    int v18 = v16 + 2;
+
+    if (a2 <= v16 + 2)
+    {
+        LOG("ERROR: Buffer too small after header");
+        LOG("  Need: %d, Have: %d", v16 + 2, a2);
+        va_end(va);
+        return 0;
+    }
+
+    int v19 = 0;
+    int v20 = 0;
+
+    LOG("----- Processing %d parameters -----", a4);
+
+    // Xử lý từng parameter
+    while (v19 < a4)
+    {
+        const char* v23 = va_arg(va, const char*);
+        
+        LOG("Parameter[%d]: %s", v19, SAFE_STR(v23));
+        
+        // XỬ LÝ AN TOÀN: nếu NULL thì dùng chuỗi rỗng
+        const char* safe_param = v23 ? v23 : "";
+        
+        size_t v24 = strlen(safe_param) + 1;
+        uint8_t v25 = (uint8_t)(v24 - 1);
+        
+        LOG("  Data length: %d bytes", v25);
+        LOG("  Value: '%s'", safe_param);
+
+        // Kiểm tra overflow
+        if (v18 + 2 + v25 >= a2)
         {
-            dest[v16 - 1] = 125; // '}'
-            va_end(va);
-            return 1;
-        }
-
-        dest[v16 - 1] = 42; // '*'
-        int v18 = v16 + 2;
-
-        if (a2 <= v16 + 2)
-        {
-            LOG("Buffer too small after header");
+            LOG("ERROR: Buffer overflow");
+            LOG("  Current position: %d", v18);
+            LOG("  Need: %d more bytes", 2 + v25);
+            LOG("  Buffer size: %d", a2);
             va_end(va);
             return 0;
         }
 
-        int v19 = 0;
-        int v20 = 0;
+        // Ghi header
+        dest[v18] = 42;              // '*'
+        dest[v18 + 1] = v25;
+        
+        LOG("  Header: '*' at [%d], length=%d at [%d]", v18, v25, v18 + 1);
+        
+        // Ghi data
+        char* v27 = &dest[v18 + 2];
+        unsigned int v28 = v25;
 
-        while (1)
+        if (v28 >= 8)
         {
-            const char* v23 = va_arg(va, const char*);
-			
-			
-            LOG("arg[%d]=%p", v19, v23);
-
-            if (!v23)
-            {
-                LOG("arg NULL");
-                va_end(va);
-                return 0;
-            }
-
-            size_t v24 = strlen(v23) + 1;
-            uint8_t v25 = (uint8_t)(v24 - 1);
-
-            if (v18 + 2 + v25 >= a2)
-            {
-                LOG("Prevented overflow");
-                va_end(va);
-                return 0;
-            }
-
-            dest[v18] = 42;              // '*'
-            dest[v18 + 1] = v25;
-
-            char* v27 = &dest[v18 + 2];
-            unsigned int v28 = v25;
-
-            if (v28 >= 8)
-            {
-                memcpy(v27, v23, v28);
-            }
-            else if (v28 & 4)
-            {
-                *(uint32_t*)v27 = *(uint32_t*)v23;
-                *(uint32_t*)&v27[v28 - 4] = *(uint32_t*)&v23[v28 - 4];
-            }
-            else if (v28)
-            {
-                *v27 = *v23;
-                if (v28 & 2)
-                    *(uint16_t*)&v27[v28 - 2] = *(uint16_t*)&v23[v28 - 2];
-            }
-
-            v18 += 2 + v25;
-            v20 += v25 + 2;
-
-            if (a4 == ++v19)
-                break;
+            memcpy(v27, safe_param, v28);
+        }
+        else if (v28 & 4)
+        {
+            *(uint32_t*)v27 = *(uint32_t*)safe_param;
+            if (v28 > 4)
+                *(uint32_t*)&v27[v28 - 4] = *(uint32_t*)&safe_param[v28 - 4];
+        }
+        else if (v28)
+        {
+            *v27 = *safe_param;
+            if (v28 & 2)
+                *(uint16_t*)&v27[v28 - 2] = *(uint16_t*)&safe_param[v28 - 2];
         }
 
-        if (v20 == 56)
-        {
-            if (v18 >= a2)
-            {
-                va_end(va);
-                return 0;
-            }
-
-            dest[v18++] = 32; // padding
-            v20++;
-        }
-
-        if (v18 < a2)
-        {
-            dest[v18] = 125; // '}'
-
-            if (v18 + 1 < a2)
-            {
-                dest[v18 + 1] = 0;
-                dest[v16] = v19;
-                dest[v16 + 1] = v20 + 3;
-
-                LOG("final arg_count=%d payload=%d", v19, v20 + 3);
-                LOG("FINAL STRING: %s", dest);
-
-                va_end(va);
-                return 1;
-            }
-        }
+        v18 += 2 + v25;
+        v20 += v25 + 2;
+        
+        LOG("  After parameter[%d]: v18=%d, v20=%d", v19, v18, v20);
+        
+        v19++;
     }
 
-    LOG("Buffer too small for format");
+    LOG("----- Parameter processing complete -----");
+    LOG("v20 total = %d", v20);
+
+    // Xử lý padding nếu cần (giữ logic gốc)
+    if (v20 == 56)
+    {
+        LOG("v20 == 56, adding space padding");
+        if (v18 >= a2)
+        {
+            LOG("ERROR: No space for padding");
+            va_end(va);
+            return 0;
+        }
+        dest[v18++] = 32; // space padding
+        v20++;
+        LOG("  Added space at position %d, v20=%d", v18 - 1, v20);
+    }
+
+    // Thêm closing '}'
+    if (v18 < a2)
+    {
+        LOG("Adding closing '}' at position %d", v18);
+        dest[v18] = 125; // '}'
+        
+        if (v18 + 1 < a2)
+        {
+            LOG("Adding null terminator at position %d", v18 + 1);
+            dest[v18 + 1] = 0;
+            
+            LOG("Writing metadata:");
+            LOG("  dest[%d] = arg_count = %d", v16, v19);
+            LOG("  dest[%d] = total_len = %d", v16 + 1, v20 + 3);
+            
+            dest[v16] = v19;
+            dest[v16 + 1] = v20 + 3;
+            
+            LOG("Packaging complete: %d bytes written", v18 + 2);
+            
+            // Log hex dump để debug (tùy chọn)
+            LOG("Hex dump of final buffer:");
+            char hex_line[256] = {0};
+            int hex_pos = 0;
+            for (int i = 0; i < v18 + 2; i++)
+            {
+                hex_pos += sprintf(hex_line + hex_pos, "%02X ", (unsigned char)dest[i]);
+                if ((i + 1) % 16 == 0)
+                {
+                    LOG("  %s", hex_line);
+                    hex_pos = 0;
+                }
+            }
+            if (hex_pos > 0)
+            {
+                LOG("  %s", hex_line);
+            }
+            
+            va_end(va);
+            return 1;
+        }
+        else
+        {
+            LOG("ERROR: No space for null terminator at %d", v18 + 1);
+        }
+    }
+    else
+    {
+        LOG("ERROR: v18 (%d) >= a2 (%d), cannot add closing '}'", v18, a2);
+    }
+
     va_end(va);
-    return result;
+    return 0;
 }
+
 
 
 
@@ -1485,7 +2602,7 @@ private:
 			//sleep(45); // Hoặc 
 		//	std::this_thread::sleep_for(std::chrono::seconds(45));
 			// Hook FoxLuaScript::RegisterFunction ngay lập tức
-			LOG("Attempting to hook ScriptGlobal_Format...");
+			LOG("=============== Attempting to hook ScriptGlobal_Format... s===============");
 
 			uintptr_t target = 0x6B0F70;   // offset bạn cung cấp __int64 ScriptGlobal_Format(
 			LOG("ScriptGlobal_Format runtime addr: %p", (void*)target);
@@ -1503,16 +2620,73 @@ private:
 				(void*)ScriptGlobal_Format_Hook
 			);
 
-			LOG("ScriptGlobal_Format hooked successfully");
+			LOG("=============== ScriptGlobal_Format hooked successfully ===============");
 
 		}).detach(); // detach để thread tự quản lý
 		
+		//----------------------------------------LuaFnScriptGlobal_Format------------------------------------------------//
 
+	   std::thread([]()
+		{
+			LOG("Hook thread started, waiting 15 seconds...");
+			std::this_thread::sleep_for(std::chrono::seconds(15));
+
+			//LOG("10 seconds elapsed, starting hook installation...");
+
+			//uintptr_t lua_addr    = base + OFFSET_LUA_FN;
+			//uintptr_t format_addr = base + OFFSET_FORMAT;
+
+			LOG("LuaFnScriptGlobal_Format runtime address = %p", (void*)OFFSET_LUA_FN);
+			LOG("ScriptGlobal_Format runtime address      = %p", (void*)OFFSET_FORMAT);
+
+			// Verify addresses are valid
+			LOG("Checking if addresses are accessible...");
+			
+			// Test read first byte
+			volatile unsigned char test = *(volatile unsigned char*)OFFSET_LUA_FN;
+			LOG("First byte at LuaFn: 0x%02X", test);
+			
+			test = *(volatile unsigned char*)OFFSET_FORMAT;
+			LOG("First byte at Format: 0x%02X", test);
+
+			g_ScriptGlobal_Formattt = (ScriptGlobal_Format_tttt)(OFFSET_FORMAT);
+			LOG("g_ScriptGlobal_Formattt set to %p", (void*)g_ScriptGlobal_Formattt);
+
+			LOG("Creating trampoline at %p...", (void*)OFFSET_LUA_FN);
+			g_trampoline = HookEngine::create_trampoline((void*)OFFSET_LUA_FN, 32);
+
+			if (!g_trampoline)
+			{
+				LOG("ERROR: create_trampoline failed!");
+				return;
+			}
+
+			LOG("Trampoline created at %p", g_trampoline);
+			g_orig_LuaFn = (LuaFnScriptGlobal_Format_t)g_trampoline;
+
+			LOG("Patching code at %p to jump to hook %p...", 
+				(void*)OFFSET_LUA_FN, (void*)LuaFnScriptGlobal_Format_Hook);
+			
+			HookEngine::patch_code_safe(
+				(void*)OFFSET_LUA_FN,
+				(void*)LuaFnScriptGlobal_Format_Hook
+			);
+
+			LOG("==================================================");
+			LOG("     HOOK INSTALLED SUCCESSFULLY");
+			LOG("==================================================");
+			LOG("LuaFnScriptGlobal_Format -> %p", (void*)OFFSET_LUA_FN);
+			LOG("Hook function             -> %p", (void*)LuaFnScriptGlobal_Format_Hook);
+			LOG("Trampoline (original)     -> %p", g_trampoline);
+			LOG("==================================================");
+
+		}).detach();
+    		
 		//------------------------------------------fix thu cuoi----------------------------------------------//
 		// Tạo thread riêng để hook skill sau 45 giây (không block thread chính)
 		std::thread([this]() {
 			//sleep(30); // Hoặc 
-			std::this_thread::sleep_for(std::chrono::seconds(45));
+			std::this_thread::sleep_for(std::chrono::seconds(35));
 			
 			void* skill_addr = dlsym(RTLD_DEFAULT, 
 				"_ZNK13Combat_Module12Skill_Module16CommonSkill005_T16EffectOnUnitOnceER13Obj_CharacterS3_i");
